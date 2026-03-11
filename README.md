@@ -35,13 +35,13 @@ If you use Docker/Compose, you do not need a `systemd` unit for the Songbird Nod
 If you want the manual install flow fully automated, use:
 
 ```bash
-bash scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/bllackbull/Songbird/main/scripts/install.sh | bash
 ```
 
-Or run remotely:
+Later access the script globally with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bllackbull/Songbird/main/scripts/install.sh | bash
+songbird-deploy
 ```
 
 The script currently supports Debian/Ubuntu and opens an interactive menu:
@@ -59,7 +59,7 @@ Install flow prompts for:
 - Default or custom app `PORT`
 - `FILE_UPLOAD` enable/disable
 - `MESSAGE_FILE_RETENTION` days
-- Optional advanced settings edit (`.env` opens, then script continues after close)
+- Optional advanced settings edit
 
 ## Option A: Docker + Compose (recommended)
 

@@ -119,7 +119,8 @@ prompt_port() {
   while true; do
     prompt_read "Enter application port (default: $DEFAULT_PORT): " value
     if [[ -z "$value" ]]; then
-      value="$DEFAULT_PORT"
+      printf "%s" "$DEFAULT_PORT"
+      return 0
     fi
     if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )); then
       printf "%s" "$value"
@@ -132,7 +133,7 @@ prompt_port() {
 prompt_retention_days() {
   local value=""
   while true; do
-    prompt_read "Enter MESSAGE_FILE_RETENTION in days (0 disables, default: $DEFAULT_RETENTION_DAYS): " value
+    prompt_read "Enter files auto deletion interval in days (0 disables, default: $DEFAULT_RETENTION_DAYS): " value
     if [[ -z "$value" ]]; then
       value="$DEFAULT_RETENTION_DAYS"
     fi
@@ -362,19 +363,19 @@ collect_install_options() {
     NGINX_SERVER_NAME="_"
   fi
 
-  if [[ "$(prompt_yes_no "Use default app port (${DEFAULT_PORT})" "yes")" == "yes" ]]; then
-    APP_PORT="$DEFAULT_PORT"
-  else
-    APP_PORT="$(prompt_port)"
-  fi
+  APP_PORT="$(prompt_port)"
 
-  if [[ "$(prompt_yes_no "Enable FILE_UPLOAD" "yes")" == "yes" ]]; then
+  if [[ "$(prompt_yes_no "Enable file uploads" "yes")" == "yes" ]]; then
     FILE_UPLOAD="true"
   else
     FILE_UPLOAD="false"
   fi
 
-  RETENTION_DAYS="$(prompt_retention_days)"
+  if [[ "$FILE_UPLOAD" == "true" ]]; then
+    RETENTION_DAYS="$(prompt_retention_days)"
+  else
+    RETENTION_DAYS="0"
+  fi
 }
 
 write_full_env_with_defaults() {
@@ -404,7 +405,6 @@ Group=${SERVICE_GROUP}
 WorkingDirectory=${INSTALL_DIR}/server
 ExecStart=/usr/bin/env node index.js
 Restart=on-failure
-Environment=APP_ENV=production
 
 [Install]
 WantedBy=multi-user.target
@@ -481,7 +481,6 @@ configure_ssl_if_needed() {
 
   log "Requesting SSL certificate from Let's Encrypt..."
   run_as_root certbot "${certbot_args[@]}"
-  run_as_root certbot renew --dry-run
 }
 
 backup_database() {
@@ -489,7 +488,7 @@ backup_database() {
     warn "Server directory not found; skipping DB backup."
     return 0
   fi
-  log "Backing up database before update/removal..."
+  log "Backing up database before update..."
   if ! run_in_install_dir "npm --prefix server run db:backup"; then
     warn "DB backup command failed. Continuing, but verify backups manually."
   fi
@@ -528,9 +527,22 @@ update_songbird() {
   [[ -d "$INSTALL_DIR/.git" ]] || fail "No Songbird install found at ${INSTALL_DIR}."
 
   backup_database
+
+  local before after
+  before="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
+
   run_in_install_dir "git fetch --all --prune"
   run_in_install_dir "git checkout main"
   run_in_install_dir "git pull --ff-only origin main"
+
+  after="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
+
+  if [[ "$before" == "$after" ]]; then
+    log "Songbird is already up to date. No rebuild needed."
+    return 0
+  fi
+
+  log "New version detected. Installing dependencies..."
   install_songbird_dependencies
   run_migrations
   apply_ownership
@@ -538,13 +550,27 @@ update_songbird() {
   log "Restarting Songbird service..."
   run_as_root systemctl restart songbird.service
   run_as_root systemctl reload nginx
+
   log "Update completed."
 }
 
 edit_settings() {
   local env_file="${INSTALL_DIR}/.env"
   [[ -f "$env_file" ]] || fail "No .env found at ${env_file}. Run install first."
+
+  local before after
+  before="$(sha256sum "$env_file" | awk '{print $1}')"
+
   open_env_editor "$env_file"
+
+  after="$(sha256sum "$env_file" | awk '{print $1}')"
+
+  if [[ "$before" == "$after" ]]; then
+    log "No changes detected in .env. Skipping rebuild."
+    return 0
+  fi
+
+  log "Changes detected. Applying updates..."
   rebuild_and_restart_after_settings_change
   log "Settings applied."
 }
@@ -554,10 +580,6 @@ remove_songbird() {
   if [[ "$(prompt_yes_no "This will remove Songbird from this server. Continue" "no")" != "yes" ]]; then
     log "Removal canceled."
     return 0
-  fi
-
-  if [[ "$(prompt_yes_no "Create database backup before removal" "yes")" == "yes" ]]; then
-    backup_database
   fi
 
   if run_as_root systemctl list-unit-files | grep -q "^songbird.service"; then
@@ -616,6 +638,7 @@ install_songbird() {
   configure_ssl_if_needed
 
   log "Installation complete."
+  log "Songbird has been installed successfully."
   if [[ "$DEPLOY_MODE" == "domain" ]]; then
     log "Visit: https://${DOMAIN_NAME}"
   else
@@ -673,7 +696,8 @@ show_menu() {
   printf "3) Edit Settings (.env)\n"
   printf "4) Remove Songbird\n"
   printf "5) Reinstall global command (songbird-deploy)\n"
-  printf "6) Exit\n"
+  printf "6) View Logs\n"
+  printf "7) Exit\n"
 }
 
 main() {
@@ -693,8 +717,9 @@ main() {
       3) edit_settings ;;
       4) remove_songbird ;;
       5) install_global_command ;;
-      6) break ;;
-      *) printf "Invalid choice. Select a number from 1 to 6.\n" ;;
+      6) view_logs ;;
+      7) break ;;
+      *) printf "Invalid choice. Select a number from 1 to 7.\n" ;;
     esac
   done
 }
