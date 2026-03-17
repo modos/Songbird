@@ -14,4 +14,7 @@ services:
       APP_ENV: ${APP_ENV:-production}
       PORT: ${PORT:-5174}
     volumes:
-      - /opt/songbird/data:/app/data
+      - songbird-data:/app/data
+
+volumes:
+  songbird-data:

@@ -21,9 +21,10 @@ This repository contains the Songbird chat application. The server uses a file-b
 
 ## Installation and Deployment
 
-Docker support is included and is a good default for most deployments because it standardizes runtime dependencies and process restarts.
-
-If you use Docker/Compose, you do not need a `systemd` unit for the Songbird Node process. The container runtime handles process lifecycle (`restart: unless-stopped` in Compose). You can still use `systemd` for non-Docker deployments.
+There are three ways available to install the app:
+- [Easy to install Script](#deployment-script) (Recommended)
+- [Docker](#install-via-docker)
+- [Manual Installation](#manual-installation)
 
 **Prerequisites (tested on Ubuntu 22.04+):**
 
@@ -32,7 +33,7 @@ If you use Docker/Compose, you do not need a `systemd` unit for the Songbird Nod
 
 ## Deployment Script
 
-If you want the manual install flow fully automated, use:
+If you want to use the easy to install script, use:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bllackbull/Songbird/main/scripts/install.sh | bash
@@ -44,32 +45,14 @@ Later access the script globally with:
 songbird-deploy
 ```
 
-The script currently supports Debian/Ubuntu and opens an interactive menu:
-
-1. Install Songbird
-2. Update Songbird
-3. Edit Settings (`.env`) and apply changes (client rebuild + service reloads)
-4. Remove Songbird
-5. Install global command (`songbird-deploy`)
-
-Install flow prompts for:
-
-- Domain vs IP deployment
-- Domain name (and SSL via Certbot) when domain mode is selected
-- Default or custom app `PORT`
-- `FILE_UPLOAD` enable/disable
-- `MESSAGE_FILE_RETENTION` days
-- Optional advanced settings edit
-
-## Option A: Docker + Compose (recommended)
+## Install via Docker
 
 ### 1. System Setup
 
 Install these packages:
 
 ```bash
-sudo apt update
-sudo apt install -y git curl build-essential nginx python3-certbot-nginx ffmpeg ca-certificates gnupg lsb-release
+sudo apt install -y ca-certificates gnupg lsb-release
 ```
 
 Add Docker official GPG key:
@@ -117,14 +100,14 @@ cd /opt/songbird
 git clone https://github.com/bllackbull/Songbird.git .
 ```
 
-### 3. Start
+### 3. Build container
 
 ```bash
 cd /opt/songbird
 docker compose -f docker-compose.yaml up -d --build
 ```
 
-Optional: Verify app is built successfully:
+Optional: Verify container is built successfully:
 
 ```bash
 docker compose -f docker-compose.yaml ps
@@ -133,7 +116,7 @@ docker compose -f docker-compose.yaml logs -f
 
 To complete the setup, refer to the [Configure Nginx](#configure-nginx) section.
 
-## Option B: Manual Installation
+## Manual Installation
 
 ### 1. System setup
 
@@ -146,7 +129,7 @@ sudo apt install -y git curl build-essential nginx python3-certbot-nginx ffmpeg
 
 Install Node.js and npm (pick one):
 
-**NodeSource**:
+**NodeSource (Recommended)**:
 
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
@@ -251,6 +234,7 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin songbird
 
 ```bash
 sudo chown -R songbird:songbird /opt/songbird
+git config --global --add safe.directory /opt/songbird
 ```
 
 **Enable and start the service:**

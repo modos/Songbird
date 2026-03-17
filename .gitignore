@@ -16,7 +16,11 @@ data/
 .env
 .env.local
 
+# Logs
+logs/
+
 # OS/editor
 .DS_Store
+.todo
 .vscode/
 .idea/

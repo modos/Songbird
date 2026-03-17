@@ -236,6 +236,7 @@ export default function App() {
     }
   }, [])
 
+
   useEffect(() => {
     let isMounted = true
     const fetchSession = async () => {
