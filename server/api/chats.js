@@ -62,6 +62,13 @@ function registerChatRoutes(app, deps) {
     const fallbackOrigin = `${forwardedProto || req.protocol}://${forwardedHost || req.get("host")}`;
     return (refererOrigin || originHeader || fallbackOrigin).replace(/\/+$/, "");
   };
+  const normalizeGroupAvatarUrl = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    if (raw.startsWith("/api/uploads/avatars/")) return raw;
+    if (raw.startsWith("/uploads/avatars/")) return `/api${raw}`;
+    return raw;
+  };
 
   app.get("/api/chats", async (req, res) => {
     const session = requireSession(req, res);
@@ -338,7 +345,7 @@ function registerChatRoutes(app, deps) {
         name: chat.name || "Group",
         username: chat.group_username || "",
         color: chat.group_color || "#10b981",
-        avatarUrl: chat.group_avatar_url || null,
+        avatarUrl: normalizeGroupAvatarUrl(chat.group_avatar_url),
         visibility: chat.group_visibility || "public",
         allowMemberInvites: Boolean(Number(chat.allow_member_invites || 0)),
         membersCount: members.length,

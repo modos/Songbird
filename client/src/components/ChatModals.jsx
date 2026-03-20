@@ -254,10 +254,10 @@ export function NewGroupModal({
                     {getAvatarInitials(avatarName || "G")}
                   </div>
                 )}
-                <div className="flex w-full flex-col items-start gap-2 sm:flex-row sm:items-center">
+                <div className="flex w-full flex-nowrap items-center gap-2">
                   <label
                     htmlFor="groupPhotoInput"
-                    className={`flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold transition ${
+                    className={`inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-full border px-3 py-2 text-xs font-semibold transition ${
                       fileUploadEnabled
                         ? "cursor-pointer border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:shadow-md dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-200 dark:hover:bg-emerald-500/20 dark:hover:shadow-md"
                         : "cursor-not-allowed border-slate-300 bg-slate-100 text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-500"
@@ -283,7 +283,7 @@ export function NewGroupModal({
                         event.stopPropagation();
                         onAvatarRemove?.();
                       }}
-                      className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-rose-200 bg-rose-50 text-rose-600 transition hover:border-rose-300 hover:bg-rose-100 hover:shadow-md dark:border-rose-500/30 dark:bg-rose-900/40 dark:text-rose-200 dark:hover:bg-rose-800/50"
+                      className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-rose-200 bg-rose-50 text-rose-600 transition hover:border-rose-300 hover:bg-rose-100 hover:shadow-md dark:border-rose-500/30 dark:bg-rose-900/40 dark:text-rose-200 dark:hover:bg-rose-800/50"
                       aria-label="Remove group photo"
                     >
                       <Trash size={18} className="icon-anim-sway" />
@@ -597,10 +597,16 @@ export function NewGroupModal({
             type="button"
             onClick={onCreate}
             disabled={creatingGroup}
-            className="inline-flex items-center gap-2 rounded-full bg-emerald-500 px-4 py-2 text-xs font-semibold text-white transition hover:bg-emerald-400 disabled:opacity-70"
+            className="inline-flex min-w-[88px] items-center justify-center gap-2 rounded-full bg-emerald-500 px-4 py-2 text-xs font-semibold text-white transition hover:bg-emerald-400 disabled:opacity-70"
           >
-            {creatingGroup ? <LoaderCircle size={14} className="animate-spin" /> : null}
-            {submitLabel}
+            {creatingGroup ? (
+              <>
+                <LoaderCircle size={14} className="animate-spin" />
+                Saving...
+              </>
+            ) : (
+              submitLabel
+            )}
           </button>
         </div>
       </div>

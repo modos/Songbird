@@ -3559,7 +3559,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         onAvatarChange={handleGroupAvatarChange}
         onAvatarRemove={handleGroupAvatarRemove}
         showAvatarField={editingGroup}
-        hideSelectedMemberChips={editingGroup}
+        hideSelectedMemberChips={false}
         fileUploadEnabled={CHAT_PAGE_CONFIG.fileUploadEnabled}
         showInviteManagement={editingGroup}
         currentInviteLink={editGroupInviteLink}

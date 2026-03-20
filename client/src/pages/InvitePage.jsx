@@ -107,6 +107,10 @@ export default function InvitePage({
 
   const groupName = group?.name || "Group";
   const groupInitials = getAvatarInitials(groupName);
+  const rawGroupAvatarUrl = String(group?.avatarUrl || "").trim();
+  const groupAvatarUrl = rawGroupAvatarUrl.startsWith("/uploads/")
+    ? `/api${rawGroupAvatarUrl}`
+    : rawGroupAvatarUrl;
 
   return (
     <section className="app-scroll relative my-auto w-full max-w-md max-h-[calc(100dvh-5.5rem)] overflow-y-auto rounded-3xl border border-emerald-200/70 bg-white/80 p-6 shadow-2xl shadow-emerald-500/10 backdrop-blur dark:border-white/5 dark:bg-slate-900/80 sm:max-h-none sm:overflow-visible sm:p-8">
@@ -153,12 +157,20 @@ export default function InvitePage({
         ) : (
           <>
             <div className="rounded-2xl border border-emerald-200/80 bg-emerald-50/60 p-4 text-center dark:border-emerald-500/30 dark:bg-emerald-500/10">
-              <div
-                className={`mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-full text-2xl font-bold ${hasPersian(groupInitials) ? "font-fa" : ""}`}
-                style={getAvatarStyle(group?.color || "#10b981")}
-              >
-                {groupInitials}
-              </div>
+              {groupAvatarUrl ? (
+                <img
+                  src={groupAvatarUrl}
+                  alt={groupName}
+                  className="mx-auto mb-3 h-16 w-16 rounded-full object-cover"
+                />
+              ) : (
+                <div
+                  className={`mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-full text-2xl font-bold ${hasPersian(groupInitials) ? "font-fa" : ""}`}
+                  style={getAvatarStyle(group?.color || "#10b981")}
+                >
+                  {groupInitials}
+                </div>
+              )}
               <p className="text-base font-semibold text-emerald-800 dark:text-emerald-200">
                 {groupName}
               </p>
