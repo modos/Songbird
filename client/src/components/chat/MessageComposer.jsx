@@ -24,20 +24,32 @@ export function MessageComposer({
   setShowUploadMenu,
   uploadMenuRef,
   handleVideoThumbLoadedMetadata,
+  onComposerHeightChange,
 }) {
+  const composerRef = useRef(null);
   const messageInputRef = useRef(null);
   const [isRtl, setIsRtl] = useState(false);
   const maxTextareaHeight = 136;
   const replyIsRtl = replyTarget ? hasPersian(replyTarget.body || "") : false;
   const replyBodyText = replyTarget?.body || "";
+  const isGenericReplyMediaText = /^Sent (a media file|a photo|a video|a document|\d+ files)$/i.test(
+    String(replyBodyText || "").trim(),
+  );
   const derivedReplyIcon = (() => {
     if (!replyTarget) return null;
     if (replyTarget.icon) return replyTarget.icon;
     if (/^Sent a video/i.test(replyBodyText)) return "video";
     if (/^Sent a photo/i.test(replyBodyText)) return "image";
+    if (/^Sent a media file/i.test(replyBodyText)) return "image";
     if (/^Sent (a document|\d+ files)/i.test(replyBodyText)) return "document";
     return null;
   })();
+  const resolvedReplyText =
+    derivedReplyIcon === "video"
+      ? (isGenericReplyMediaText ? "Sent a video" : replyBodyText || "Message")
+      : derivedReplyIcon === "image"
+        ? (isGenericReplyMediaText ? "Sent a photo" : replyBodyText || "Message")
+        : replyBodyText || "Message";
 
   const resizeTextarea = () => {
     const el = messageInputRef.current;
@@ -47,6 +59,9 @@ export function MessageComposer({
     el.style.height = `${Math.max(44, nextHeight)}px`;
     el.style.overflowY = el.scrollHeight > maxTextareaHeight ? "auto" : "hidden";
     onComposerResize?.();
+    if (composerRef.current) {
+      onComposerHeightChange?.(Number(composerRef.current.offsetHeight || 0));
+    }
   };
 
   useEffect(() => {
@@ -65,6 +80,7 @@ export function MessageComposer({
 
   return (
     <form
+      ref={composerRef}
       className="sticky bottom-0 z-30 flex flex-col gap-3 border-t border-slate-300/80 bg-white px-4 py-3 dark:border-emerald-500/20 dark:bg-slate-900 sm:px-6 md:static md:mt-auto md:shrink-0"
       style={{
         bottom: isDesktop ? undefined : "max(0px, var(--mobile-bottom-offset, 0px))",
@@ -77,7 +93,19 @@ export function MessageComposer({
         requestAnimationFrame(() => {
           setIsRtl(false);
           resizeTextarea();
+          if (!isDesktop) {
+            messageInputRef.current?.focus();
+          }
         });
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+        if (!pendingUploadFiles?.length) return;
+        if (!isDesktop) return;
+        const activeEl = document.activeElement;
+        if (activeEl === messageInputRef.current) return;
+        event.preventDefault();
+        event.currentTarget?.requestSubmit?.();
       }}
     >
       {replyTarget ? (
@@ -104,7 +132,7 @@ export function MessageComposer({
                 ) : derivedReplyIcon === "document" ? (
                   <File size={12} className="shrink-0 text-slate-500 dark:text-slate-400" />
                 ) : null}
-                <span className="min-w-0 truncate">{replyTarget.body || "Message"}</span>
+                <span className="min-w-0 truncate">{resolvedReplyText}</span>
               </span>
             </div>
             <button
@@ -320,6 +348,7 @@ export function MessageComposer({
             resizeTextarea();
           }}
           onKeyDown={(event) => {
+            if (!isDesktop) return;
             if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
             event.preventDefault();
             event.currentTarget.form?.requestSubmit();
@@ -337,6 +366,11 @@ export function MessageComposer({
         />
         <button
           type="submit"
+          onMouseDown={(event) => {
+            if (!isDesktop) {
+              event.preventDefault();
+            }
+          }}
           className="inline-flex h-11 items-center justify-center rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-emerald-500/30 transition hover:bg-emerald-400 hover:shadow-emerald-500/40"
         >
           <Send className="icon-anim-slide" />

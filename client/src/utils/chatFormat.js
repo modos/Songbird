@@ -37,3 +37,35 @@ export const formatTime = (dateValue) =>
     minute: "2-digit",
     hour12: false,
   });
+
+export const formatChatCardTimestamp = (dateValue) => {
+  const date = parseServerDate(dateValue);
+  if (!Number.isFinite(date.getTime())) return "";
+
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const diffDays = Math.floor((startOfToday - startOfDate) / (1000 * 60 * 60 * 24));
+
+  if (diffDays <= 0) {
+    return formatTime(date);
+  }
+
+  if (diffDays < 7) {
+    const shortDay = date.toLocaleDateString("en-US", { weekday: "short" }).slice(0, 3);
+    return `${shortDay.toLowerCase()}.`;
+  }
+
+  if (date.getFullYear() === now.getFullYear()) {
+    return date.toLocaleDateString("en-US", {
+      month: "2-digit",
+      day: "2-digit",
+    });
+  }
+
+  return date.toLocaleDateString("en-US", {
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+  });
+};

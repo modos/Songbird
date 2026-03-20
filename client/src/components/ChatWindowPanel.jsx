@@ -92,6 +92,7 @@ export default function ChatWindowPanel({
   const mediaInputRef = useRef(null);
   const documentInputRef = useRef(null);
   const [showUploadMenu, setShowUploadMenu] = useState(false);
+  const [composerHeight, setComposerHeight] = useState(80);
   const [mediaAspectByKey, setMediaAspectByKey] = useState(() => ({}));
   const [videoPosterByUrl, setVideoPosterByUrl] = useState(() => {
     if (typeof window === "undefined") return {};
@@ -105,8 +106,6 @@ export default function ChatWindowPanel({
   });
   const uploadBusy = !fileUploadEnabled || fileUploadInProgress;
   const timelineBottomSpacerPx = 4;
-  const replyOrUploadOffset =
-    replyTarget || (pendingUploadFiles?.length ?? 0) > 0 ? 64 : 0;
   const {
     focusedMedia,
     setFocusedMedia,
@@ -510,14 +509,36 @@ export default function ChatWindowPanel({
           target.scrollIntoView({ block: "center", behavior: "smooth" });
         }
         const bubble = target?.querySelector?.("[data-message-bubble]");
-        if (bubble) {
+        if (!bubble) return;
+        let flashed = false;
+        const playFlash = () => {
+          if (flashed) return;
+          flashed = true;
           bubble.classList.remove("reply-flash");
           void bubble.offsetWidth;
           bubble.classList.add("reply-flash");
           window.setTimeout(() => {
             bubble.classList.remove("reply-flash");
           }, 700);
+        };
+        const scrollRoot = chatScrollRef?.current || null;
+        if (!("IntersectionObserver" in window)) {
+          window.setTimeout(playFlash, 360);
+          return;
         }
+        const observer = new IntersectionObserver(
+          (entries) => {
+            if (!entries.some((entry) => entry.isIntersecting)) return;
+            observer.disconnect();
+            playFlash();
+          },
+          { root: scrollRoot, threshold: 0.5 },
+        );
+        observer.observe(target);
+        window.setTimeout(() => {
+          observer.disconnect();
+          playFlash();
+        }, 900);
       }}
     />
   );
@@ -715,6 +736,9 @@ export default function ChatWindowPanel({
         setShowUploadMenu={setShowUploadMenu}
         uploadMenuRef={uploadMenuRef}
         handleVideoThumbLoadedMetadata={handleVideoThumbLoadedMetadata}
+        onComposerHeightChange={(value) => {
+          setComposerHeight(Math.max(80, Number(value || 80)));
+        }}
       />
 
       {activeChatId && userScrolledUp ? (
@@ -723,7 +747,9 @@ export default function ChatWindowPanel({
           onClick={onJumpToLatest}
           className="absolute inline-flex h-11 w-11 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 shadow-lg transition hover:border-emerald-300 dark:border-emerald-500/30 dark:bg-slate-950 dark:text-emerald-200"
           style={{
-            bottom: `max(80px + 0.05rem, calc(80px + env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px) + 0.05rem + ${replyOrUploadOffset}px))`,
+            bottom: isDesktop
+              ? `${Math.max(80, composerHeight + 8)}px`
+              : `calc(${Math.max(80, composerHeight + 8)}px + env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px))`,
             right: "0.85rem",
             transform: "none",
           }}
@@ -734,7 +760,7 @@ export default function ChatWindowPanel({
           </span>
           {unreadInChat > 0 ? (
             <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-emerald-500 px-2 text-[10px] font-bold text-white">
-              {unreadInChat}
+              {unreadInChat > 999 ? "+999" : unreadInChat}
             </span>
           ) : null}
         </button>

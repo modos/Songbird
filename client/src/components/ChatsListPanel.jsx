@@ -19,7 +19,7 @@ export default function ChatsListPanel({
   editMode,
   activeChatId,
   selectedChats,
-  formatTime,
+  formatChatTimestamp,
   requestDeleteChats,
   toggleSelectChat,
   setActiveChatId,
@@ -294,7 +294,10 @@ export default function ChatsListPanel({
                     ) : null}
                     <span className={hasPersian(name) ? "font-fa" : ""}>{name}</span>
                   </p>
-                  <p className="mt-1 w-full min-w-0 overflow-hidden text-xs leading-[1.35] text-slate-500 dark:text-slate-400">
+                  <p
+                    className="mt-1 w-full min-w-0 overflow-hidden text-xs leading-[1.35] text-slate-500 dark:text-slate-400"
+                    style={{ unicodeBidi: "plaintext" }}
+                  >
                     {conv.last_message ||
                     (conv.last_message_files || []).length ? (
                       conv.last_sender_username === user.username ? (
@@ -320,7 +323,9 @@ export default function ChatsListPanel({
                               />
                             ) : null}
                             <span
+                              dir="auto"
                               className={`block min-w-0 max-w-full flex-1 truncate leading-[1.35] ${hasPersian(lastPreview.text) ? "font-fa" : ""}`}
+                              style={{ unicodeBidi: "plaintext" }}
                             >
                               {isOwnLastMessagePending
                                 ? "Processing..."
@@ -352,7 +357,9 @@ export default function ChatsListPanel({
                             />
                           ) : null}
                           <span
+                            dir="auto"
                             className={`block min-w-0 max-w-full flex-1 truncate leading-[1.35] ${hasPersian(lastPreview.text) ? "font-fa" : ""}`}
+                            style={{ unicodeBidi: "plaintext" }}
                           >
                             {lastPreview.text}
                           </span>
@@ -395,7 +402,7 @@ export default function ChatsListPanel({
                         )}
                       </span>
                     ) : null}
-                    <p>{conv.last_time ? formatTime(conv.last_time) : ""}</p>
+                    <p>{conv.last_time ? formatChatTimestamp(conv.last_time) : ""}</p>
                   </div>
                   {conv.unread_count > 0 ? (
                     <span className={`inline-flex h-5 min-w-[20px] items-center justify-center rounded-full px-2 text-[10px] font-bold text-white ${

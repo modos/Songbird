@@ -58,6 +58,20 @@ export function MessageFiles({
     return `${Math.max(1, Math.round(bytes / kb))} KB`;
   };
 
+  const truncateFileNameKeepExt = (name, maxBaseChars = 14) => {
+    const fullName = String(name || "document");
+    const lastDot = fullName.lastIndexOf(".");
+    if (lastDot <= 0 || lastDot === fullName.length - 1) {
+      return fullName.length > maxBaseChars + 3
+        ? `${fullName.slice(0, maxBaseChars)}...`
+        : fullName;
+    }
+    const base = fullName.slice(0, lastDot);
+    const ext = fullName.slice(lastDot + 1);
+    if (base.length <= maxBaseChars) return fullName;
+    return `${base.slice(0, maxBaseChars)}...${ext}`;
+  };
+
   const cacheVideoPoster = (videoUrl, videoEl) => {
     if (!videoUrl || !videoEl || videoPosterByUrl[videoUrl]) return;
     try {
@@ -323,14 +337,16 @@ export function MessageFiles({
             href={file.url}
             download={file.name || undefined}
             rel="noopener noreferrer"
-            className="group inline-flex w-fit max-w-full items-center gap-2 rounded-xl border border-emerald-200/70 bg-white/70 px-3 py-2.5 text-xs text-slate-700 transition hover:border-emerald-300 hover:bg-white hover:shadow-[0_0_16px_rgba(16,185,129,0.18)] dark:border-emerald-500/30 dark:bg-slate-900/50 dark:text-slate-200 dark:hover:bg-slate-900/70 dark:hover:shadow-[0_0_16px_rgba(16,185,129,0.14)]"
+            className="group inline-flex w-fit min-w-[220px] max-w-full items-center gap-2 rounded-xl border border-emerald-200/70 bg-white/70 px-3 py-2.5 text-xs text-slate-700 transition hover:border-emerald-300 hover:bg-white hover:shadow-[0_0_16px_rgba(16,185,129,0.18)] dark:border-emerald-500/30 dark:bg-slate-900/50 dark:text-slate-200 dark:hover:bg-slate-900/70 dark:hover:shadow-[0_0_16px_rgba(16,185,129,0.14)]"
           >
             <span className="relative inline-flex h-5 w-5 shrink-0 items-center justify-center">
               <File size={18} className="absolute text-emerald-600 transition-opacity duration-150 group-hover:opacity-0 dark:text-emerald-300" />
               <Download size={18} className="absolute text-emerald-600 opacity-0 transition-opacity duration-150 group-hover:opacity-100 dark:text-emerald-300" />
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block whitespace-normal break-words">{file.name || "document"}</span>
+              <span className="block truncate whitespace-nowrap">
+                {truncateFileNameKeepExt(file.name || "document")}
+              </span>
               <span className="mt-0.5 block text-[10px] text-slate-500 dark:text-slate-400">
                 {formatFileSize(file.sizeBytes)}
               </span>
@@ -339,11 +355,13 @@ export function MessageFiles({
         ) : (
           <div
             key={key}
-            className="inline-flex w-fit max-w-full items-center gap-2 rounded-xl border border-emerald-200/70 bg-white/70 px-3 py-2.5 text-xs text-slate-700 dark:border-emerald-500/30 dark:bg-slate-900/50 dark:text-slate-200"
+            className="inline-flex w-fit min-w-[220px] max-w-full items-center gap-2 rounded-xl border border-emerald-200/70 bg-white/70 px-3 py-2.5 text-xs text-slate-700 dark:border-emerald-500/30 dark:bg-slate-900/50 dark:text-slate-200"
           >
             <File size={18} className="shrink-0 text-emerald-600 dark:text-emerald-300" />
             <span className="min-w-0 flex-1">
-              <span className="block whitespace-normal break-words">{file.name || "document"}</span>
+              <span className="block truncate whitespace-nowrap">
+                {truncateFileNameKeepExt(file.name || "document")}
+              </span>
               <span className="mt-0.5 block text-[10px] text-slate-500 dark:text-slate-400">
                 {formatFileSize(file.sizeBytes)}
               </span>

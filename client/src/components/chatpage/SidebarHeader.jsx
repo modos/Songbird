@@ -5,6 +5,7 @@ export default function SidebarHeader({
   mobileTab,
   editMode,
   isConnected,
+  isUpdating,
   hasChats,
   selectedChatsCount,
   onExitEdit,
@@ -83,10 +84,16 @@ export default function SidebarHeader({
             </div>
             <h2 className="text-center text-lg font-semibold">
               <span className="inline-flex items-center gap-2">
-                {!editMode && !isConnected ? (
+                {!editMode && (!isConnected || isUpdating) ? (
                   <LoaderCircle className="h-5 w-5 animate-spin text-emerald-500" />
                 ) : null}
-                {editMode ? "Edit" : isConnected ? "Chats" : "Connecting..."}
+                {editMode
+                  ? "Edit"
+                  : !isConnected
+                    ? "Connecting..."
+                    : isUpdating
+                      ? "Updating..."
+                      : "Chats"}
               </span>
             </h2>
             <div className="flex justify-end">

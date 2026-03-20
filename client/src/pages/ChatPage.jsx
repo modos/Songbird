@@ -14,6 +14,7 @@ import { CHAT_PAGE_CONFIG } from "../settings/chatPageConfig.js";
 import { getAvatarInitials } from "../utils/avatarInitials.js";
 import {
   formatBytesAsMb,
+  formatChatCardTimestamp,
   formatDayLabel,
   formatTime,
   parseServerDate,
@@ -159,6 +160,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     user?.status || "online",
   );
   const [isConnected, setIsConnected] = useState(false);
+  const [isUpdatingChats, setIsUpdatingChats] = useState(false);
+  const [sidebarScrollEpoch, setSidebarScrollEpoch] = useState(0);
   const [activePeer, setActivePeer] = useState(null);
   const [peerPresence, setPeerPresence] = useState({
     status: "offline",
@@ -194,6 +197,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const loadChatsRef = useRef(null);
   const scheduleMessageRefreshRef = useRef(null);
   const presenceStateRef = useRef(new Map());
+  const wasAppActiveRef = useRef(
+    document.visibilityState === "visible" && document.hasFocus(),
+  );
 
   const truncateText = (text, maxChars) => {
     const value = String(text || "");
@@ -217,17 +223,18 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     typeof window !== "undefined" && Boolean(window.isSecureContext);
   const hasNotificationApi =
     typeof window !== "undefined" && "Notification" in window;
-  const iosRequiresStandalone = isIOSDevice && !isStandaloneDisplay;
+  const isMobileUa = /Android|iPhone|iPad|iPod/i.test(uaString);
+  const mobileRequiresStandalone = isMobileUa && !isStandaloneDisplay;
   const notificationsSupported =
-    hasNotificationApi && isSecureContext && !iosRequiresStandalone;
+    hasNotificationApi && isSecureContext && !mobileRequiresStandalone;
   const notificationsAllowed = notificationPermission === "granted";
   const notificationsActive = notificationsEnabled && notificationsAllowed;
   const notificationStatusLabel = !hasNotificationApi
     ? "Not supported in this browser"
     : !isSecureContext
       ? "Connection is not secure"
-      : iosRequiresStandalone
-        ? "Requires Home Screen install"
+      : mobileRequiresStandalone
+        ? "Require Home screen installation"
         : notificationPermission === "denied"
           ? "Blocked in browser settings"
           : "";
@@ -491,7 +498,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
   useEffect(() => {
     if (user) {
-      void loadChats();
+      void loadChats({ showUpdating: true });
     }
   }, [user]);
 
@@ -1308,6 +1315,24 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, []);
 
   useEffect(() => {
+    if (!user?.username) {
+      wasAppActiveRef.current = isAppActive;
+      return;
+    }
+    const becameActive = isAppActive && !wasAppActiveRef.current;
+    wasAppActiveRef.current = isAppActive;
+    if (!becameActive) return;
+    loadChatsRef.current?.({ silent: true, showUpdating: true });
+    const activeId = Number(activeChatIdRef.current || 0);
+    if (activeId > 0) {
+      scheduleMessageRefreshRef.current?.(activeId, {
+        delayMs: 120,
+        preserveHistory: true,
+      });
+    }
+  }, [isAppActive, user?.username]);
+
+  useEffect(() => {
     const activeId = activeChatIdRef.current;
     if (
       !activeId ||
@@ -1712,8 +1737,12 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [settingsPanel, profileError, passwordError]);
 
   async function loadChats(options = {}) {
+    const showUpdating = Boolean(options.showUpdating);
     if (!options.silent) {
       setLoadingChats(true);
+    }
+    if (showUpdating) {
+      setIsUpdatingChats(true);
     }
     try {
       const res = await listChatsForUser(user.username, { cache: "no-store" });
@@ -1857,6 +1886,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       if (!options.silent) {
         setLoadingChats(false);
       }
+      if (showUpdating) {
+        setIsUpdatingChats(false);
+      }
     }
   }
 
@@ -1943,10 +1975,29 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           _systemEvent: normalizedSystemType ? { type: normalizedSystemType, text: systemText } : null,
         };
       });
+      const replyIconByMessageId = new Map(
+        nextMessages
+          .map((message) => [Number(message?.id || 0), resolveReplyPreview(message).icon || null])
+          .filter(([id, icon]) => Number.isFinite(id) && id > 0 && Boolean(icon)),
+      );
+      const nextMessagesWithReplyIcons = nextMessages.map((message) => {
+        if (!message?.replyTo || message.replyTo.icon) return message;
+        const replyId = Number(message.replyTo.id || 0);
+        if (!replyId) return message;
+        const resolvedIcon = replyIconByMessageId.get(replyId) || null;
+        if (!resolvedIcon) return message;
+        return {
+          ...message,
+          replyTo: {
+            ...message.replyTo,
+            icon: resolvedIcon,
+          },
+        };
+      });
       if (options.prepend) {
         setMessages((prev) => {
           const seen = new Set(prev.map((msg) => Number(msg.id)));
-          const older = nextMessages.filter((msg) => !seen.has(Number(msg.id)));
+          const older = nextMessagesWithReplyIcons.filter((msg) => !seen.has(Number(msg.id)));
           return older.length ? [...older, ...prev] : prev;
         });
         return;
@@ -1962,7 +2013,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
             .map((msg) => [Number(msg._serverId || msg.id), msg]),
         );
         const prevLocalCandidates = prev.filter((msg) => Boolean(msg?._clientId));
-        const nextMessagesWithLocalIdentity = nextMessages.map((serverMsg) => {
+        const nextMessagesWithLocalIdentity = nextMessagesWithReplyIcons.map((serverMsg) => {
           let existingLocal = prevByServerId.get(Number(serverMsg.id));
           if (!existingLocal) {
             existingLocal = prevLocalCandidates.find((localMsg) => {
@@ -2545,6 +2596,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     const hasPendingFiles = pendingUploadFiles.length > 0;
     if (!trimmedBody && !hasPendingFiles) return;
 
+    const pendingFilesSummary = hasPendingFiles ? summarizeFiles(pendingUploadFiles) : "";
+
     const tempId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = new Date().toISOString();
     const queuedAt = Date.now();
@@ -2553,9 +2606,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     const fallbackBody =
       trimmedBody ||
       (hasPendingFiles
-        ? pendingUploadFiles.length === 1
-          ? `Sent ${pendingUploadType === "media" ? "a media file" : "a document"}`
-          : `Sent ${pendingUploadFiles.length} files`
+        ? pendingFilesSummary || `Sent ${pendingUploadFiles.length} files`
         : "");
     const pendingFiles = hasPendingFiles
       ? pendingUploadFiles.map((item) => ({
@@ -2584,6 +2635,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           username: replyTarget.username,
           nickname: replyTarget.nickname,
           body: replyTarget.body,
+          icon: replyTarget.icon || null,
           displayName: replyTarget.displayName,
         }
       : null;
@@ -3178,6 +3230,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       closeNewGroupModal();
       setEditingGroup(false);
       await loadChats();
+      if (editingGroup) {
+        setSidebarScrollEpoch((prev) => prev + 1);
+      }
       setActiveChatId(nextChatId);
       setActivePeer(null);
       setMobileTab("chat");
@@ -3379,13 +3434,15 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       <ChatSidebar
         mobileTab={mobileTab}
         isConnected={isConnected}
+        isUpdating={isUpdatingChats}
+        scrollEpoch={sidebarScrollEpoch}
         editMode={editMode}
         visibleChats={visibleChats}
         selectedChats={selectedChats}
         loadingChats={loadingChats}
         activeChatId={activeChatId}
         user={user}
-        formatTime={formatTime}
+        formatChatTimestamp={formatChatCardTimestamp}
         requestDeleteChats={requestDeleteChats}
         toggleSelectChat={toggleSelectChat}
         setActiveChatId={setActiveChatId}

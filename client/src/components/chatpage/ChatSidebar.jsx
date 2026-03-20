@@ -6,13 +6,15 @@ import SidebarHeader from "./SidebarHeader.jsx";
 export default function ChatSidebar({
   mobileTab,
   isConnected,
+  isUpdating,
+  scrollEpoch = 0,
   editMode,
   visibleChats,
   selectedChats,
   loadingChats,
   activeChatId,
   user,
-  formatTime,
+  formatChatTimestamp,
   requestDeleteChats,
   toggleSelectChat,
   setActiveChatId,
@@ -86,6 +88,7 @@ export default function ChatSidebar({
         mobileTab={mobileTab}
         editMode={editMode}
         isConnected={isConnected}
+        isUpdating={isUpdating}
         hasChats={Boolean(visibleChats.length)}
         selectedChatsCount={selectedChats.length}
         onExitEdit={onExitEdit}
@@ -122,7 +125,16 @@ export default function ChatSidebar({
         style={{ overscrollBehavior: "contain" }}
       >
         {mobileTab === "settings" ? (
-          <div className="app-scroll h-full overflow-y-scroll overflow-x-hidden px-6 pb-[104px] md:h-[calc(100%-88px)] md:pb-4">
+          <div
+            key={`settings-scroll-${scrollEpoch}`}
+            className="app-scroll flex h-full min-h-0 flex-col overflow-y-scroll overflow-x-hidden px-6 pb-[104px]"
+            style={{
+              overscrollBehaviorY: "contain",
+              overflowAnchor: "none",
+              WebkitOverflowScrolling: "touch",
+              scrollbarGutter: "stable both-edges",
+            }}
+          >
             <MobileSettingsPanel
               settingsPanel={settingsPanel}
               user={user}
@@ -160,8 +172,17 @@ export default function ChatSidebar({
           </div>
         ) : null}
 
-        <div className={mobileTab === "settings" ? "hidden min-h-0 h-full" : "block min-h-0 h-full"}>
-          <div className="app-scroll h-full overflow-y-scroll overflow-x-hidden px-6 pb-[104px] md:h-[calc(100%-88px)] md:pb-4">
+        <div className={mobileTab === "settings" ? "hidden min-h-0 h-full" : "flex min-h-0 h-full flex-col"}>
+          <div
+            key={`chats-scroll-${scrollEpoch}`}
+            className="app-scroll min-h-0 flex-1 overflow-y-scroll overflow-x-hidden px-6 pb-[104px]"
+            style={{
+              overscrollBehaviorY: "contain",
+              overflowAnchor: "none",
+              WebkitOverflowScrolling: "touch",
+              scrollbarGutter: "stable both-edges",
+            }}
+          >
             <ChatsListPanel
               loadingChats={loadingChats}
               visibleChats={visibleChats}
@@ -169,7 +190,7 @@ export default function ChatSidebar({
               editMode={editMode}
               activeChatId={activeChatId}
               selectedChats={selectedChats}
-              formatTime={formatTime}
+              formatChatTimestamp={formatChatTimestamp}
               requestDeleteChats={requestDeleteChats}
               toggleSelectChat={toggleSelectChat}
               setActiveChatId={setActiveChatId}

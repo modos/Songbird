@@ -45,15 +45,25 @@ export function MessageItem({
   const replyDisplayName =
     replyTarget?.nickname || replyTarget?.username || "Unknown";
   const replyPreview = String(replyTarget?.body || "").trim() || "Message";
+  const isGenericReplyMediaText = /^Sent (a media file|a photo|a video|a document|\d+ files)$/i.test(
+    String(replyTarget?.body || "").trim(),
+  );
+  const normalizedReplyPreview =
+    replyTarget?.icon === "video"
+      ? (isGenericReplyMediaText ? "Sent a video" : replyPreview)
+      : replyTarget?.icon === "image"
+        ? (isGenericReplyMediaText ? "Sent a photo" : replyPreview)
+        : replyPreview;
   const derivedReplyIcon = (() => {
     if (!replyTarget) return null;
     if (replyTarget.icon) return replyTarget.icon;
     if (/^Sent a video/i.test(replyPreview)) return "video";
     if (/^Sent a photo/i.test(replyPreview)) return "image";
+    if (/^Sent a media file/i.test(replyPreview)) return "image";
     if (/^Sent (a document|\d+ files)/i.test(replyPreview)) return "document";
     return null;
   })();
-  const replyIsRtl = hasPersian(replyPreview);
+  const replyIsRtl = hasPersian(normalizedReplyPreview);
   const senderName = msg.nickname || msg.username || "Unknown";
   const senderInitials = getAvatarInitials(senderName);
 
@@ -243,7 +253,7 @@ export function MessageItem({
                       ) : derivedReplyIcon === "document" ? (
                         <File size={11} className="shrink-0 text-slate-500 dark:text-slate-400" />
                       ) : null}
-                      <span className="min-w-0 truncate">{replyPreview}</span>
+                      <span className="min-w-0 truncate">{normalizedReplyPreview}</span>
                     </span>
                   </span>
                 </button>
@@ -251,7 +261,7 @@ export function MessageItem({
               <MessageFiles files={messageFiles} {...messageFilesProps} />
               {!(
                 (msg.files || []).length &&
-                /^Sent (a media file|a document|\d+ files)$/i.test((msg.body || "").trim())
+                /^Sent (a media file|a photo|a video|a document|\d+ files)$/i.test((msg.body || "").trim())
               ) ? (
                 <p
                   dir={hasPersian(msg.body) ? "rtl" : "ltr"}
@@ -324,7 +334,7 @@ export function MessageItem({
                   ) : derivedReplyIcon === "document" ? (
                     <File size={11} className="shrink-0 text-slate-500 dark:text-slate-400" />
                   ) : null}
-                  <span className="min-w-0 truncate">{replyPreview}</span>
+                  <span className="min-w-0 truncate">{normalizedReplyPreview}</span>
                 </span>
               </span>
             </button>
@@ -332,7 +342,7 @@ export function MessageItem({
           <MessageFiles files={messageFiles} {...messageFilesProps} />
           {!(
             (msg.files || []).length &&
-            /^Sent (a media file|a document|\d+ files)$/i.test((msg.body || "").trim())
+            /^Sent (a media file|a photo|a video|a document|\d+ files)$/i.test((msg.body || "").trim())
           ) ? (
             <p
               dir={hasPersian(msg.body) ? "rtl" : "ltr"}
