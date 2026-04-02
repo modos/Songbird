@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowDown,
   ArrowLeft,
+  Close,
+  Ghost,
   LoaderCircle,
 } from "../icons/lucide.js";
 import { getAvatarStyle } from "../utils/avatarColor.js";
@@ -25,8 +27,11 @@ export default function ChatWindowPanel({
   activeFallbackTitle,
   peerStatusLabel,
   isGroupChat = false,
+  isChannelChat = false,
+  isSavedChat = false,
   groupAvatarColor = null,
   groupAvatarUrl = "",
+  channelSeenCounts = null,
   chatScrollRef,
   onChatScroll,
   onStartReached,
@@ -46,8 +51,13 @@ export default function ChatWindowPanel({
   insecureConnection,
   pendingUploadFiles,
   pendingUploadType,
+  pendingVoiceMessage,
+  onVoiceRecorded,
+  onClearPendingVoiceMessage,
   uploadError,
   activeUploadProgress,
+  messageMaxChars = null,
+  onMessageInput,
   onMessageMediaLoaded,
   onUploadFilesSelected,
   onRemovePendingUpload,
@@ -57,11 +67,21 @@ export default function ChatWindowPanel({
   onReplyToMessage,
   onOpenHeaderProfile,
   onOpenMessageSenderProfile,
+  onOpenMention,
+  mentionRefreshToken = 0,
   onUserScrollIntent,
   fileUploadEnabled = true,
   fileUploadInProgress = false,
+  showComposer = true,
+  headerClickable = true,
+  showStatus = true,
+  headerAvatarIcon = null,
+  headerAvatarColor = null,
 }) {
-  const VIDEO_POSTER_CACHE_KEY = "chat-video-posters-v2";
+  const MEDIA_CACHE_VERSION = 1;
+  const MEDIA_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const MEDIA_THUMB_CACHE_KEY = "chat-media-thumbs-v2";
+  const VIDEO_POSTER_CACHE_KEY = "chat-video-posters-v3";
   const [isDesktop, setIsDesktop] = useState(
     typeof window !== "undefined" ? window.matchMedia("(min-width: 768px)").matches : false,
   );
@@ -70,15 +90,39 @@ export default function ChatWindowPanel({
       ? window.matchMedia("(max-width: 767px) and (pointer: coarse)").matches
       : false,
   );
-  const activePeerColor = activeHeaderPeer?.color || groupAvatarColor || "#10b981";
+  const activePeerColor =
+    activeHeaderPeer?.color || headerAvatarColor || groupAvatarColor || "#10b981";
   const activePeerInitials = getAvatarInitials(activeFallbackTitle || "S");
+  const canOpenHeaderProfile = headerClickable && typeof onOpenHeaderProfile === "function";
+
+  const readMediaCache = useCallback(
+    (key) => {
+      if (typeof window === "undefined") return null;
+      try {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || parsed.version !== MEDIA_CACHE_VERSION) return null;
+        const updatedAt = Number(parsed.updatedAt || 0);
+        if (!Number.isFinite(updatedAt)) return null;
+        if (Date.now() - updatedAt > MEDIA_CACHE_TTL_MS) {
+          window.localStorage.removeItem(key);
+          return null;
+        }
+        return parsed;
+      } catch (_) {
+        return null;
+      }
+    },
+    [MEDIA_CACHE_TTL_MS, MEDIA_CACHE_VERSION],
+  );
+
   const [loadedMediaThumbs, setLoadedMediaThumbs] = useState(() => {
     if (typeof window === "undefined") return new Set();
     try {
-      const raw = window.sessionStorage.getItem("chat-media-thumbs");
-      const parsed = raw ? JSON.parse(raw) : [];
-      if (!Array.isArray(parsed)) return new Set();
-      return new Set(parsed.map((item) => String(item)));
+      const cached = readMediaCache(MEDIA_THUMB_CACHE_KEY);
+      const items = Array.isArray(cached?.items) ? cached.items : [];
+      return new Set(items.map((item) => String(item)));
     } catch (_) {
       return new Set();
     }
@@ -97,15 +141,51 @@ export default function ChatWindowPanel({
   const [videoPosterByUrl, setVideoPosterByUrl] = useState(() => {
     if (typeof window === "undefined") return {};
     try {
-      const raw = window.sessionStorage.getItem(VIDEO_POSTER_CACHE_KEY);
-      const parsed = raw ? JSON.parse(raw) : {};
-      return parsed && typeof parsed === "object" ? parsed : {};
+      const cached = readMediaCache(VIDEO_POSTER_CACHE_KEY);
+      const posters = cached?.posters;
+      return posters && typeof posters === "object" ? posters : {};
     } catch (_) {
       return {};
     }
   });
   const uploadBusy = !fileUploadEnabled || fileUploadInProgress;
   const timelineBottomSpacerPx = 4;
+  const [hideInsecureTooltip, setHideInsecureTooltip] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem("songbird-insecure-dismissed") === "1";
+  });
+  const isLocalhost =
+    typeof window !== "undefined" &&
+    (window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1" ||
+      window.location.hostname === "::1" ||
+      window.location.hostname.endsWith(".localhost"));
+  const insecureTooltipRef = useRef(null);
+  const [insecureTooltipHeight, setInsecureTooltipHeight] = useState(0);
+  useEffect(() => {
+    if (!insecureConnection) return;
+    if (typeof window === "undefined") return;
+    const dismissed =
+      window.localStorage.getItem("songbird-insecure-dismissed") === "1";
+    setHideInsecureTooltip(dismissed);
+  }, [insecureConnection]);
+  useLayoutEffect(() => {
+    if (!insecureConnection || hideInsecureTooltip) {
+      setInsecureTooltipHeight(0);
+      return;
+    }
+    const node = insecureTooltipRef.current;
+    if (!node || typeof window === "undefined") return;
+    const measure = () => {
+      const rect = node.getBoundingClientRect();
+      setInsecureTooltipHeight(Number(rect?.height || 0));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [insecureConnection, hideInsecureTooltip]);
   const {
     focusedMedia,
     setFocusedMedia,
@@ -342,9 +422,11 @@ export default function ChatWindowPanel({
   }, [activeChatId]);
 
   useEffect(() => {
-    setLoadedMediaThumbs(new Set());
+    const cached = readMediaCache(MEDIA_THUMB_CACHE_KEY);
+    const items = Array.isArray(cached?.items) ? cached.items : [];
+    setLoadedMediaThumbs(new Set(items.map((item) => String(item))));
     setMediaAspectByKey({});
-  }, [activeChatId]);
+  }, [activeChatId, readMediaCache, MEDIA_THUMB_CACHE_KEY]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -396,9 +478,11 @@ export default function ChatWindowPanel({
             : "0.75rem"
           : undefined,
       paddingBottom: activeChatId
-        ? `max(1rem, calc(env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px) + ${
-            isDesktop ? "1rem" : "1rem"
-          }))`
+        ? showComposer
+          ? `max(1rem, calc(env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px) + ${
+              isDesktop ? "1rem" : "1rem"
+            }))`
+          : `max(1rem, calc(env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px)))`
         : undefined,
       overflowAnchor: "none",
     }),
@@ -443,16 +527,20 @@ export default function ChatWindowPanel({
 
   const getFileRenderType = (file) => {
     const explicitKind = String(file?.kind || "").toLowerCase();
+    const mimeType = String(file?.mimeType || "").toLowerCase();
+    const name = String(file?.name || "").toLowerCase();
+    if (mimeType.startsWith("audio/")) return "audio";
+    if (explicitKind === "voice" || explicitKind === "audio") return "audio";
     if (explicitKind === "document") return "document";
     if (explicitKind === "media") {
       const explicitMime = String(file?.mimeType || "").toLowerCase();
       if (explicitMime.startsWith("image/")) return "image";
       if (explicitMime.startsWith("video/")) return "video";
     }
-    const mimeType = String(file?.mimeType || "").toLowerCase();
-    const name = String(file?.name || "").toLowerCase();
+    if (mimeType.startsWith("audio/")) return "audio";
     if (mimeType.startsWith("image/")) return "image";
     if (mimeType.startsWith("video/")) return "video";
+    if (/\.(mp3|m4a|aac|wav|ogg|opus|webm)$/.test(name)) return "audio";
     if (/\.(gif|png|jpe?g|webp|bmp|svg)$/.test(name)) return "image";
     if (/\.(mp4|mov|webm|mkv|avi|m4v)$/.test(name)) return "video";
     return "document";
@@ -483,6 +571,8 @@ export default function ChatWindowPanel({
     videoPosterByUrl,
     setVideoPosterByUrl,
     videoPosterCacheKey: VIDEO_POSTER_CACHE_KEY,
+    mediaThumbCacheKey: MEDIA_THUMB_CACHE_KEY,
+    mediaCacheVersion: MEDIA_CACHE_VERSION,
     openFocusMedia,
     onMessageMediaLoaded,
     handleVideoThumbLoadedMetadata,
@@ -502,7 +592,17 @@ export default function ChatWindowPanel({
       isMobileTouchDevice={isMobileTouchDevice}
       onReply={onReplyToMessage}
       isGroupChat={isGroupChat}
+      isChannelChat={isChannelChat}
+      seenCount={
+        isChannelChat
+          ? channelSeenCounts?.[Number(msg?._serverId || msg?.id || 0)] ??
+            msg?.seenCount ??
+            null
+          : null
+      }
       onOpenSenderProfile={onOpenMessageSenderProfile}
+      onOpenMention={onOpenMention}
+      mentionRefreshToken={mentionRefreshToken}
       onJumpToMessage={(messageId) => {
         const target = document.getElementById(`message-${messageId}`);
         if (target && typeof target.scrollIntoView === "function") {
@@ -570,85 +670,172 @@ export default function ChatWindowPanel({
             >
               <ArrowLeft size={18} />
             </button>
-            <div className="flex flex-1 flex-col items-center justify-center gap-1">
+            <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-1">
               <>
-                <button
-                  type="button"
-                  onClick={onOpenHeaderProfile}
-                  className="text-center text-lg font-semibold transition hover:text-emerald-600 dark:hover:text-emerald-300"
-                >
-                  <span className={hasPersian(activeFallbackTitle) ? "font-fa" : ""}>
+                {activeHeaderPeer?.isDeleted ? (
+                  <span
+                    className={`block min-w-0 max-w-[60vw] truncate text-center text-lg font-semibold text-slate-500 dark:text-slate-400 sm:max-w-[40vw] md:max-w-[28vw] ${
+                      hasPersian(activeFallbackTitle) ? "font-fa" : ""
+                    }`}
+                    dir="auto"
+                    style={{ unicodeBidi: "plaintext" }}
+                    title={activeFallbackTitle}
+                  >
                     {activeFallbackTitle}
                   </span>
-                </button>
-                <p className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                  {!isConnected ? (
-                    <>
-                      <LoaderCircle className="h-4 w-4 animate-spin text-emerald-500" />
-                      Connecting...
-                    </>
+                ) : (
+                  canOpenHeaderProfile ? (
+                    <button
+                      type="button"
+                      onClick={onOpenHeaderProfile}
+                      className="min-w-0 max-w-[60vw] text-center text-lg font-semibold transition hover:text-emerald-600 dark:hover:text-emerald-300 sm:max-w-[40vw] md:max-w-[28vw]"
+                      dir="auto"
+                      style={{ unicodeBidi: "plaintext" }}
+                      title={activeFallbackTitle}
+                    >
+                      <span
+                        className={`block min-w-0 truncate ${
+                          hasPersian(activeFallbackTitle) ? "font-fa" : ""
+                        }`}
+                        dir="auto"
+                        style={{ unicodeBidi: "plaintext" }}
+                      >
+                        {activeFallbackTitle}
+                      </span>
+                    </button>
                   ) : (
-                    isGroupChat ? (
-                      <>{peerStatusLabel}</>
-                    ) : (
+                    <span
+                      className={`block min-w-0 max-w-[60vw] truncate text-center text-lg font-semibold text-slate-700 dark:text-slate-100 sm:max-w-[40vw] md:max-w-[28vw] ${
+                        hasPersian(activeFallbackTitle) ? "font-fa" : ""
+                      }`}
+                      dir="auto"
+                      style={{ unicodeBidi: "plaintext" }}
+                      title={activeFallbackTitle}
+                    >
+                      {activeFallbackTitle}
+                    </span>
+                  )
+                )}
+                {showStatus ? (
+                  <p className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    {!isConnected ? (
                       <>
-                        <span
-                          className={`h-2 w-2 rounded-full ${
-                            peerStatusLabel === "online" ? "bg-emerald-400" : "bg-slate-400"
-                          }`}
-                        />
-                        {peerStatusLabel}
+                        <LoaderCircle className="h-4 w-4 animate-spin text-emerald-500" />
+                        Connecting...
                       </>
-                    )
-                  )}
-                </p>
+                    ) : (
+                      isGroupChat || isChannelChat ? (
+                        <span className="whitespace-nowrap text-[11px] sm:text-xs">
+                          {peerStatusLabel}
+                        </span>
+                      ) : (
+                        <>
+                          <span
+                            className={`h-2 w-2 rounded-full ${
+                              peerStatusLabel === "online" ? "bg-emerald-400" : "bg-slate-400"
+                            }`}
+                          />
+                          {peerStatusLabel}
+                        </>
+                      )
+                    )}
+                  </p>
+                ) : null}
               </>
             </div>
-            {activeHeaderPeer ? (
-              activeHeaderPeer?.avatar_url ? (
-                <button
-                  type="button"
-                  onClick={onOpenHeaderProfile}
-                  className="group"
+            {headerAvatarIcon ? (
+              <div
+                className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full"
+                style={getAvatarStyle(activePeerColor)}
+              >
+                {headerAvatarIcon}
+              </div>
+            ) : activeHeaderPeer ? (
+              activeHeaderPeer?.isDeleted ? (
+                <div
+                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full"
+                  style={getAvatarStyle(activePeerColor)}
                 >
+                  <Ghost size={18} className="text-slate-600" />
+                </div>
+              ) : activeHeaderPeer?.avatar_url ? (
+                canOpenHeaderProfile ? (
+                  <button
+                    type="button"
+                    onClick={onOpenHeaderProfile}
+                    className="group"
+                  >
+                    <img
+                      src={activeHeaderPeer?.avatar_url}
+                      alt={activeFallbackTitle}
+                      className="h-9 w-9 flex-shrink-0 rounded-full object-cover transition group-hover:ring-2 group-hover:ring-emerald-300"
+                    />
+                  </button>
+                ) : (
                   <img
                     src={activeHeaderPeer?.avatar_url}
                     alt={activeFallbackTitle}
-                    className="h-9 w-9 flex-shrink-0 rounded-full object-cover transition group-hover:ring-2 group-hover:ring-emerald-300"
+                    className="h-9 w-9 flex-shrink-0 rounded-full object-cover"
                   />
-                </button>
+                )
               ) : (
-                <button
-                  type="button"
-                  onClick={onOpenHeaderProfile}
-                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:ring-2 hover:ring-emerald-300 ${hasPersian(activePeerInitials) ? "font-fa" : ""}`}
-                  style={getAvatarStyle(activePeerColor)}
-                >
-                  {activePeerInitials}
-                </button>
+                canOpenHeaderProfile ? (
+                  <button
+                    type="button"
+                    onClick={onOpenHeaderProfile}
+                    className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:ring-2 hover:ring-emerald-300 ${hasPersian(activePeerInitials) ? "font-fa" : ""}`}
+                    style={getAvatarStyle(activePeerColor)}
+                  >
+                    {activePeerInitials}
+                  </button>
+                ) : (
+                  <div
+                    className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full ${hasPersian(activePeerInitials) ? "font-fa" : ""}`}
+                    style={getAvatarStyle(activePeerColor)}
+                  >
+                    {activePeerInitials}
+                  </div>
+                )
               )
             ) : (
               groupAvatarUrl ? (
-                <button
-                  type="button"
-                  onClick={onOpenHeaderProfile}
-                  className="group"
-                >
+                canOpenHeaderProfile ? (
+                  <button
+                    type="button"
+                    onClick={onOpenHeaderProfile}
+                    className="group"
+                  >
+                    <img
+                      src={groupAvatarUrl}
+                      alt={activeFallbackTitle}
+                      className="h-9 w-9 flex-shrink-0 rounded-full object-cover transition group-hover:ring-2 group-hover:ring-emerald-300"
+                    />
+                  </button>
+                ) : (
                   <img
                     src={groupAvatarUrl}
                     alt={activeFallbackTitle}
-                    className="h-9 w-9 flex-shrink-0 rounded-full object-cover transition group-hover:ring-2 group-hover:ring-emerald-300"
+                    className="h-9 w-9 flex-shrink-0 rounded-full object-cover"
                   />
-                </button>
+                )
               ) : (
-                <button
-                  type="button"
-                  onClick={onOpenHeaderProfile}
-                  className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:ring-2 hover:ring-emerald-300 ${hasPersian(activePeerInitials) ? "font-fa" : ""}`}
-                  style={getAvatarStyle(activePeerColor)}
-                >
-                  {activePeerInitials}
-                </button>
+                canOpenHeaderProfile ? (
+                  <button
+                    type="button"
+                    onClick={onOpenHeaderProfile}
+                    className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full transition hover:ring-2 hover:ring-emerald-300 ${hasPersian(activePeerInitials) ? "font-fa" : ""}`}
+                    style={getAvatarStyle(activePeerColor)}
+                  >
+                    {activePeerInitials}
+                  </button>
+                ) : (
+                  <div
+                    className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full ${hasPersian(activePeerInitials) ? "font-fa" : ""}`}
+                    style={getAvatarStyle(activePeerColor)}
+                  >
+                    {activePeerInitials}
+                  </div>
+                )
               )
             )}
           </div>
@@ -656,14 +843,32 @@ export default function ChatWindowPanel({
         </>
       ) : null}
 
-      {insecureConnection && activeChatId ? (
-        <div
-          className="pointer-events-none absolute left-1/2 z-[1] -translate-x-1/2"
-          style={{ top: "calc(env(safe-area-inset-top) + 122px)" }}
-        >
-          <div className="inline-flex items-center gap-1.5 rounded-full border border-rose-300 bg-rose-100 px-3 py-1 text-xs font-semibold leading-none text-rose-700 dark:border-rose-500 dark:bg-rose-900 dark:text-rose-100">
-            <AlertCircle className="h-[13px] w-[13px] shrink-0 -translate-y-[0.5px]" />
-            <span className="leading-none">Connection is not secure</span>
+      {insecureConnection && activeChatId && !hideInsecureTooltip && !isLocalhost ? (
+        <div className="w-full">
+          <div
+            ref={insecureTooltipRef}
+            className="flex w-full items-center justify-between border-y border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-700 shadow-sm dark:border-rose-500/40 dark:bg-rose-900/40 dark:text-rose-100"
+          >
+            <span className="flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 shrink-0" />
+              Connection is not secure
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                if (typeof window !== "undefined") {
+                  window.localStorage.setItem(
+                    "songbird-insecure-dismissed",
+                    "1",
+                  );
+                }
+                setHideInsecureTooltip(true);
+              }}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-rose-200 text-rose-600 transition hover:border-rose-300 hover:bg-rose-100 dark:border-rose-500/40 dark:text-rose-100 dark:hover:bg-rose-900/60"
+              aria-label="Dismiss"
+            >
+              <Close size={14} className="icon-anim-pop relative -left-[0.5px]" />
+            </button>
           </div>
         </div>
       ) : null}
@@ -672,7 +877,13 @@ export default function ChatWindowPanel({
         {activeChatId && floatingDay.key && isTimelineScrollable ? (
           <div
             className="absolute left-1/2 z-[3] -translate-x-1/2"
-            style={{ top: "calc(env(safe-area-inset-top) + 84px)" }}
+            style={{
+              top: `calc(env(safe-area-inset-top) + 84px + ${
+                insecureConnection && activeChatId && !hideInsecureTooltip && !isLocalhost
+                  ? Math.max(0, (insecureTooltipHeight || 56) + 16)
+                  : 0
+              }px)`,
+            }}
           >
             <button
               ref={floatingChipRef}
@@ -699,7 +910,7 @@ export default function ChatWindowPanel({
           </div>
         ) : (
           <MessageTimeline
-            loadingMessages={loadingMessages || (!isConnected && messages.length === 0)}
+            loadingMessages={loadingMessages}
             messages={messages}
             groupedMessages={groupedMessages}
             loadingOlderMessages={loadingOlderMessages}
@@ -714,32 +925,39 @@ export default function ChatWindowPanel({
         )}
       </div>
 
-      <MessageComposer
-        activeChatId={activeChatId}
-        isDesktop={isDesktop}
-        handleSend={handleSend}
-        onComposerResize={handleComposerResize}
-        replyTarget={replyTarget}
-        onClearReply={onClearReply}
-        pendingUploadFiles={pendingUploadFiles}
-        pendingUploadType={pendingUploadType}
-        fileUploadEnabled={fileUploadEnabled}
-        mediaInputRef={mediaInputRef}
-        documentInputRef={documentInputRef}
-        onClearPendingUploads={onClearPendingUploads}
-        onRemovePendingUpload={onRemovePendingUpload}
-        onUploadFilesSelected={onUploadFilesSelected}
-        uploadError={uploadError}
-        activeUploadProgress={activeUploadProgress}
-        uploadBusy={uploadBusy}
-        showUploadMenu={showUploadMenu}
-        setShowUploadMenu={setShowUploadMenu}
-        uploadMenuRef={uploadMenuRef}
-        handleVideoThumbLoadedMetadata={handleVideoThumbLoadedMetadata}
-        onComposerHeightChange={(value) => {
-          setComposerHeight(Math.max(80, Number(value || 80)));
-        }}
-      />
+      {showComposer ? (
+        <MessageComposer
+          activeChatId={activeChatId}
+          isDesktop={isDesktop}
+          handleSend={handleSend}
+          onComposerResize={handleComposerResize}
+          replyTarget={replyTarget}
+          onClearReply={onClearReply}
+          pendingUploadFiles={pendingUploadFiles}
+          pendingUploadType={pendingUploadType}
+          pendingVoiceMessage={pendingVoiceMessage}
+          fileUploadEnabled={fileUploadEnabled}
+          mediaInputRef={mediaInputRef}
+          documentInputRef={documentInputRef}
+          onClearPendingUploads={onClearPendingUploads}
+          onRemovePendingUpload={onRemovePendingUpload}
+          onUploadFilesSelected={onUploadFilesSelected}
+          onVoiceRecorded={onVoiceRecorded}
+          onClearPendingVoiceMessage={onClearPendingVoiceMessage}
+          uploadError={uploadError}
+          activeUploadProgress={activeUploadProgress}
+          messageMaxChars={messageMaxChars}
+          onMessageInput={onMessageInput}
+          uploadBusy={uploadBusy}
+          showUploadMenu={showUploadMenu}
+          setShowUploadMenu={setShowUploadMenu}
+          uploadMenuRef={uploadMenuRef}
+          handleVideoThumbLoadedMetadata={handleVideoThumbLoadedMetadata}
+          onComposerHeightChange={(value) => {
+            setComposerHeight(Math.max(80, Number(value || 80)));
+          }}
+        />
+      ) : null}
 
       {activeChatId && userScrolledUp ? (
         <button
@@ -748,8 +966,8 @@ export default function ChatWindowPanel({
           className="absolute inline-flex h-11 w-11 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 shadow-lg transition hover:border-emerald-300 dark:border-emerald-500/30 dark:bg-slate-950 dark:text-emerald-200"
           style={{
             bottom: isDesktop
-              ? `${Math.max(80, composerHeight + 8)}px`
-              : `calc(${Math.max(80, composerHeight + 8)}px + env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px))`,
+              ? `${showComposer ? Math.max(80, composerHeight + 8) : 24}px`
+              : `calc(${showComposer ? Math.max(80, composerHeight + 8) : 24}px + env(safe-area-inset-bottom) + var(--mobile-bottom-offset, 0px))`,
             right: "0.85rem",
             transform: "none",
           }}

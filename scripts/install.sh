@@ -2,8 +2,17 @@
 
 set -uo pipefail
 
-trap 'clear; exit 130' INT TERM
-trap 'clear' EXIT
+handle_exit() {
+  clear
+}
+
+handle_interrupt() {
+  handle_exit
+  exit 130
+}
+
+trap 'handle_interrupt' INT TERM
+trap 'handle_exit' EXIT
 
 APP_NAME="songbird"
 INSTALL_DIR="/opt/songbird"
@@ -14,10 +23,12 @@ SERVICE_GROUP="songbird"
 SERVICE_FILE="/etc/systemd/system/songbird.service"
 NGINX_SITE_FILE="/etc/nginx/sites-available/songbird"
 NGINX_ENABLED_FILE="/etc/nginx/sites-enabled/songbird"
-DEFAULT_PORT="5174"
+DEFAULT_SERVER_PORT="5174"
+DEFAULT_CLIENT_PORT="80"
 DEFAULT_FILE_UPLOAD="true"
 DEFAULT_MAX_UPLOAD="78643200"
 DEFAULT_RETENTION_DAYS="7"
+DEFAULT_ACCOUNT_CREATION="true"
 NODE_MAJOR="24"
 SCRIPT_REMOTE_URL="${SCRIPT_REMOTE_URL:-https://raw.githubusercontent.com/bllackbull/Songbird/main/scripts/install.sh}"
 LOG_LINES="${LOG_LINES:-100}"
@@ -33,13 +44,19 @@ OS_ID_LIKE=""
 DEPLOY_MODE="ip"
 DOMAIN_NAMES=()
 CERTBOT_EMAIL=""
-APP_PORT="$DEFAULT_PORT"
+SERVER_PORT="$DEFAULT_SERVER_PORT"
+CLIENT_PORT="$DEFAULT_CLIENT_PORT"
 FILE_UPLOAD="$DEFAULT_FILE_UPLOAD"
 MAX_UPLOAD="$DEFAULT_MAX_UPLOAD"
 RETENTION_DAYS="$DEFAULT_RETENTION_DAYS"
+ACCOUNT_CREATION="$DEFAULT_ACCOUNT_CREATION"
 NGINX_SERVER_NAME="_"
 CURRENT_ENV_FILE=""
 PROMPT_FD=0
+PROMPT_FD_OUT=1
+DB_BACKUP_PATH=""
+SOURCE_MODE=""
+SOURCE_ZIP_PATH=""
 
 log() {
   local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -62,11 +79,11 @@ ensure_log_dir() {
 }
 
 warn() {
-  printf "[%s] WARNING: %s\n" "$APP_NAME-deploy" "$*" >&2
+  printf "[%s] WARNING: %s\n" "SONGBIRD" "$*" >&2
 }
 
 fail() {
-  printf "[%s] ERROR: %s\n" "$APP_NAME-deploy" "$*" >&2
+  printf "[%s] ERROR: %s\n" "SONGBIRD" "$*" >&2
   exit 1
 }
 
@@ -106,18 +123,29 @@ run_as_root() {
   fi
 }
 
+run_as_root_output() {
+  if [[ -n "$SUDO" ]]; then
+    $SUDO "$@"
+  else
+    "$@"
+  fi
+}
+
 run_in_install_dir() {
   run_silent run_as_root bash -lc "cd '$INSTALL_DIR' && $*"
 }
 
 init_prompt_io() {
-  if [[ -t 0 ]]; then
-    PROMPT_FD=0
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    exec 3</dev/tty
+    exec 4>/dev/tty
+    PROMPT_FD=3
+    PROMPT_FD_OUT=4
     return 0
   fi
-  if [[ -r /dev/tty ]]; then
-    exec 3</dev/tty
-    PROMPT_FD=3
+  if [[ -t 0 ]]; then
+    PROMPT_FD=0
+    PROMPT_FD_OUT=1
     return 0
   fi
   fail "No interactive TTY detected. Run this script in an interactive shell."
@@ -127,8 +155,10 @@ prompt_read() {
   local prompt="$1"
   local __result_var="$2"
   local input=""
-  printf "%s" "$prompt" >/dev/tty
-  IFS= read -r -u "$PROMPT_FD" input
+  printf "%s" "$prompt" >&$PROMPT_FD_OUT
+  if ! IFS= read -r -u "$PROMPT_FD" input; then
+    input=""
+  fi
   printf -v "$__result_var" "%s" "$input"
 }
 
@@ -137,6 +167,25 @@ prompt_non_empty() {
   local value=""
   while true; do
     prompt_read "$prompt: " value
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ -n "$value" ]]; then
+      printf "%s" "$value"
+      return 0
+    fi
+    printf "Please provide a value.\n"
+  done
+}
+
+prompt_secret() {
+  local prompt="$1"
+  local value=""
+  while true; do
+    printf "%s: " "$prompt" >&$PROMPT_FD_OUT
+    if ! IFS= read -ers -u "$PROMPT_FD" value; then
+      value=""
+    fi
+    printf "\n" >&$PROMPT_FD_OUT
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     if [[ -n "$value" ]]; then
@@ -168,9 +217,25 @@ prompt_yes_no() {
 prompt_port() {
   local value=""
   while true; do
-    prompt_read "Enter server port (default: $DEFAULT_PORT): " value
+    prompt_read "Enter server port (default: $DEFAULT_SERVER_PORT): " value
     if [[ -z "$value" ]]; then
-      printf "%s" "$DEFAULT_PORT"
+      printf "%s" "$DEFAULT_SERVER_PORT"
+      return 0
+    fi
+    if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )); then
+      printf "%s" "$value"
+      return 0
+    fi
+    printf "Port must be an integer between 1 and 65535.\n"
+  done
+}
+
+prompt_client_port() {
+  local value=""
+  while true; do
+    prompt_read "Enter client (nginx) port (default: $DEFAULT_CLIENT_PORT): " value
+    if [[ -z "$value" ]]; then
+      printf "%s" "$DEFAULT_CLIENT_PORT"
       return 0
     fi
     if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )); then
@@ -194,6 +259,220 @@ prompt_retention_days() {
     fi
     printf "Please enter a non-negative integer.\n"
   done
+}
+
+normalize_path_input() {
+  local value="$1"
+  if [[ "$value" == "~"* ]]; then
+    printf "%s" "${value/#\~/$HOME}"
+    return 0
+  fi
+  printf "%s" "$value"
+}
+
+strip_surrounding_quotes() {
+  local value="$1"
+  local first="${value:0:1}"
+  local last="${value: -1}"
+  if [[ ( "$first" == "\"" && "$last" == "\"" ) || ( "$first" == "'" && "$last" == "'" ) ]]; then
+    printf "%s" "${value:1:${#value}-2}"
+    return 0
+  fi
+  printf "%s" "$value"
+}
+
+strip_carriage_returns() {
+  local value="$1"
+  printf "%s" "$value" | tr -d '\r'
+}
+
+file_exists_path() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    return 0
+  fi
+  if [[ -n "$SUDO" ]]; then
+    $SUDO test -f "$path"
+    return $?
+  fi
+  return 1
+}
+
+resolve_file_path() {
+  local raw="$1"
+  local value=""
+  value="$(normalize_path_input "$raw")"
+  value="$(strip_surrounding_quotes "$value")"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value="$(strip_carriage_returns "$value")"
+  if [[ -z "$value" ]]; then
+    return 1
+  fi
+
+  if [[ "$value" == /* ]]; then
+    if file_exists_path "$value"; then
+      printf "%s" "$value"
+      return 0
+    fi
+    return 1
+  fi
+
+  local candidates=(
+    "$PWD/$value"
+    "$HOME/$value"
+    "/root/$value"
+    "/$value"
+  )
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    if file_exists_path "$candidate"; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+clear_mirror_values() {
+  MIRROR_NODESOURCE=""
+  MIRROR_APT_EXTRA=""
+  MIRROR_NPM=""
+}
+
+configure_mirrors_menu() {
+  while true; do
+    clear
+    show_banner
+    printf "\n"
+    printf "Configure Mirrors\n"
+    printf $'1) 🔗  Set NodeSource mirror (current: %s)\n' "${MIRROR_NODESOURCE:-<default>}"
+    printf $'2) 🔗  Set apt mirror source (current: %s)\n' "${MIRROR_APT_EXTRA:-<none>}"
+    printf $'3) 🔗  Set npm registry mirror (current: %s)\n' "${MIRROR_NPM:-<default>}"
+    printf $'4) 🔄️  Restore defaults (clear mirrors)\n'
+    printf $'5) ↩️  Go back\n\n'
+
+    prompt_read "Choose an option [1-5]: " choice
+    case "$choice" in
+      1)
+        local val=""
+        prompt_read "NodeSource mirror base URL (blank to clear): " val
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        MIRROR_NODESOURCE="$val"
+        ;;
+      2)
+        local val=""
+        prompt_read "Extra apt source line for packages (blank to clear): " val
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        MIRROR_APT_EXTRA="$val"
+        ;;
+      3)
+        local val=""
+        prompt_read "npm registry mirror URL (blank to clear): " val
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        MIRROR_NPM="$val"
+        ;;
+      4)
+        clear_mirror_values
+        ;;
+      5) return ;;
+      *) printf "Invalid choice. Select a number from 1 to 5.\n" ;;
+    esac
+  done
+}
+
+prompt_source_mode() {
+  local mode=""
+  while true; do
+    printf "\nSource Mode\n"
+    printf "1) GitHub\n"
+    printf "2) Offline\n"
+    prompt_read "Choose an option [1-2] (default: 1): " mode
+    mode="${mode#"${mode%%[![:space:]]*}"}"
+    mode="${mode%"${mode##*[![:space:]]}"}"
+    [[ -z "$mode" ]] && mode="1"
+    case "$mode" in
+      1)
+        SOURCE_MODE="github"
+        break
+        ;;
+      2)
+        SOURCE_MODE="offline"
+        break
+        ;;
+      *) printf "Choose 1 or 2.\n" ;;
+    esac
+  done
+}
+
+validate_backup_zip() {
+  local zip_path="$1"
+  local listing
+  listing="$(run_as_root_output unzip -Z1 "$zip_path" 2>/dev/null || true)"
+  if [[ -z "$listing" ]]; then
+    printf "Backup zip appears empty or unreadable.\n"
+    return 1
+  fi
+  if ! echo "$listing" | grep -qE '(^|/)(songbird\.db)$'; then
+    printf "Backup zip missing songbird.db.\n"
+    return 1
+  fi
+  if ! echo "$listing" | grep -qE '(^|/)uploads(/|$)'; then
+    printf "Backup zip missing uploads/ directory.\n"
+    return 1
+  fi
+  return 0
+}
+
+zip_contains_data_dir() {
+  local zip_path="$1"
+  local listing
+  listing="$(run_as_root_output unzip -Z1 "$zip_path" 2>/dev/null || true)"
+  if [[ -z "$listing" ]]; then
+    return 1
+  fi
+  echo "$listing" | grep -qE '(^|/)data(/|$)'
+}
+
+prepare_source_root_for_data_copy() {
+  local zip_path="$1"
+  local source_root="$2"
+  local action_label="$3"
+
+  if ! zip_contains_data_dir "$zip_path"; then
+    return 0
+  fi
+
+  if [[ "$(prompt_yes_no "Source zip includes data/. Replace ${INSTALL_DIR}/data during ${action_label}?" "no")" != "yes" ]]; then
+    log "Keeping existing data/. Skipping data/ from source zip."
+    if [[ -d "$source_root/data" ]]; then
+      run_silent run_as_root rm -rf "$source_root/data"
+    fi
+  fi
+}
+
+extract_backup_zip() {
+  local zip_path="$1"
+  local tmp_dir="$2"
+
+  run_silent run_as_root unzip -q "$zip_path" -d "$tmp_dir"
+
+  local source_dir="$tmp_dir"
+  if [[ -d "$tmp_dir/data" ]]; then
+    source_dir="$tmp_dir/data"
+  fi
+
+  local db_src="$source_dir/songbird.db"
+  local uploads_src="$source_dir/uploads"
+
+  if [[ ! -f "$db_src" || ! -d "$uploads_src" ]]; then
+    return 1
+  fi
+
+  printf "%s" "$source_dir"
 }
 
 detect_os() {
@@ -229,6 +508,8 @@ install_required_packages() {
     python3-certbot-nginx
     ffmpeg
     nano
+    zip
+    unzip
   )
   local missing_pkgs=()
   local pkg=""
@@ -239,24 +520,20 @@ install_required_packages() {
     fi
   done
 
+  local codename=$(lsb_release -sc)
   if [[ -n "$MIRROR_APT_EXTRA" ]]; then
-    local mirror_list="/etc/apt/sources.list.d/songbird-mirror.list"
-    local pref_file="/etc/apt/preferences.d/songbird-mirror"
-    local codename=$(lsb_release -sc)
-
-    log "Adding mirror apt source: ${MIRROR_APT_EXTRA}"
-
-    printf "deb %s %s main restricted universe multiverse\n" "$MIRROR_APT_EXTRA" "$codename" \
-      | run_silent run_as_root tee "$mirror_list" >/dev/null
-
-    printf "Package: *\nPin: origin %s\nPin-Priority: 1001\n" \
-      "$(echo "$MIRROR_APT_EXTRA" | sed 's|https\?://||;s|/.*||')" \
-      | run_silent run_as_root tee "$pref_file" >/dev/null
+    log "Refreshing apt package index (temporary mirror: ${MIRROR_APT_EXTRA})..."
+    run_silent run_as_root apt-get update \
+      -o Dir::Etc::sourcelist=/dev/null \
+      -o Dir::Etc::sourceparts=/dev/null \
+      -o Dir::Etc::sourcelist=- \
+      -o Dir::Etc::sourceparts=- <<EOF
+deb ${MIRROR_APT_EXTRA} ${codename} main restricted universe multiverse
+EOF
+  else
+    log "Refreshing apt package index..."
+    run_silent run_as_root apt-get update
   fi
-
-
-  log "Refreshing apt package index..."
-  run_silent run_as_root apt-get update
 
   if (( ${#missing_pkgs[@]} > 0 )); then
     log "Installing missing packages: ${missing_pkgs[*]}"
@@ -346,6 +623,100 @@ clone_repo() {
   run_silent run_as_root git clone "$REPO_URL" "$INSTALL_DIR"
 }
 
+prepare_install_dir_for_offline() {
+  run_silent run_as_root mkdir -p "$INSTALL_DIR"
+  if run_silent run_as_root test -n "$(run_silent run_as_root find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
+    fail "${INSTALL_DIR} is not empty. Clear it or use another install path for offline mode."
+  fi
+}
+
+resolve_offline_source_root() {
+  local tmp_dir="$1"
+  if [[ -f "$tmp_dir/package.json" && -d "$tmp_dir/server" && -d "$tmp_dir/client" ]]; then
+    printf "%s" "$tmp_dir"
+    return 0
+  fi
+  local entry_count
+  entry_count="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')"
+  if [[ "$entry_count" -eq 1 ]]; then
+    local only_dir
+    only_dir="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    if [[ -f "$only_dir/package.json" && -d "$only_dir/server" && -d "$only_dir/client" ]]; then
+      printf "%s" "$only_dir"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+has_source_at_install_dir() {
+  if [[ ! -d "$INSTALL_DIR" ]]; then
+    return 1
+  fi
+  [[ -f "$INSTALL_DIR/package.json" && -d "$INSTALL_DIR/server" && -d "$INSTALL_DIR/client" ]]
+}
+
+ensure_offline_source_ready() {
+  local mode_label="$1"
+  if ! has_source_at_install_dir; then
+    log "Offline ${mode_label} requires the source code at ${INSTALL_DIR}."
+    log "Copy or extract Songbird into ${INSTALL_DIR} and try again."
+    press_enter_to_continue
+    return 1
+  fi
+  return 0
+}
+
+install_source_from_zip() {
+  local zip_path="$1"
+  have_cmd unzip || fail "unzip is required for offline installs. Install it first and retry."
+
+  prepare_install_dir_for_offline
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  run_silent run_as_root unzip -q "$zip_path" -d "$tmp_dir"
+
+  local source_root
+  source_root="$(resolve_offline_source_root "$tmp_dir")" || {
+    run_silent run_as_root rm -rf "$tmp_dir"
+    fail "Source zip does not appear to contain Songbird (missing server/client/package.json)."
+  }
+
+  prepare_source_root_for_data_copy "$zip_path" "$source_root" "install"
+
+  run_silent run_as_root cp -a "$source_root"/. "$INSTALL_DIR"/
+  if [[ -f "$source_root/.env.example" ]]; then
+    run_silent run_as_root cp -a "$source_root/.env.example" "$INSTALL_DIR/.env.example"
+  fi
+  apply_ownership
+  run_silent run_as_root rm -rf "$tmp_dir"
+}
+
+update_source_from_zip() {
+  local zip_path="$1"
+  have_cmd unzip || fail "unzip is required for offline updates. Install it first and retry."
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  run_silent run_as_root unzip -q "$zip_path" -d "$tmp_dir"
+
+  local source_root
+  source_root="$(resolve_offline_source_root "$tmp_dir")" || {
+    run_silent run_as_root rm -rf "$tmp_dir"
+    fail "Source zip does not appear to contain Songbird (missing server/client/package.json)."
+  }
+
+  prepare_source_root_for_data_copy "$zip_path" "$source_root" "update"
+
+  run_silent run_as_root cp -a "$source_root"/. "$INSTALL_DIR"/
+  if [[ -f "$source_root/.env.example" ]]; then
+    run_silent run_as_root cp -a "$source_root/.env.example" "$INSTALL_DIR/.env.example"
+  fi
+  apply_ownership
+  run_silent run_as_root rm -rf "$tmp_dir"
+}
+
 install_songbird_dependencies() {
   log "Installing server dependencies..."
   if [[ -n "$MIRROR_NPM" ]]; then
@@ -382,31 +753,155 @@ get_existing_env_value() {
   fi
 }
 
-render_full_env_file() {
+get_existing_env_value_with_fallback() {
+  local primary="$1"
+  local fallback="$2"
+  local default="$3"
+  local env_file="$INSTALL_DIR/.env"
+  if [[ ! -f "$env_file" ]]; then
+    printf "%s" "$default"
+    return 0
+  fi
+  local existing
+  existing="$(grep -E "^${primary}=" "$env_file" | tail -n 1 | cut -d "=" -f 2- || true)"
+  if [[ -n "$existing" ]]; then
+    printf "%s" "$existing"
+    return 0
+  fi
+  if [[ -n "$fallback" ]]; then
+    existing="$(grep -E "^${fallback}=" "$env_file" | tail -n 1 | cut -d "=" -f 2- || true)"
+    if [[ -n "$existing" ]]; then
+      printf "%s" "$existing"
+      return 0
+    fi
+  fi
+  printf "%s" "$default"
+}
+
+replace_env_value() {
   local env_file="$1"
-  run_silent run_as_root tee "$env_file" >/dev/null <<EOF
-PORT=${APP_PORT}
+  local key="$2"
+  local value="$3"
+  local escaped
+  escaped="$(printf '%s' "$value" | sed 's/[&/]/\\&/g')"
+  if grep -qE "^${key}=" "$env_file"; then
+    run_silent run_as_root sed -i "s|^${key}=.*|${key}=${escaped}|" "$env_file"
+  else
+    run_silent run_as_root bash -lc "printf '%s\n' '${key}=${escaped}' >> '$env_file'"
+  fi
+}
+
+write_env_from_example() {
+  local env_file="${INSTALL_DIR}/.env"
+  local example_file="${INSTALL_DIR}/.env.example"
+  if [[ ! -f "$example_file" ]]; then
+    warn "Missing ${example_file}. Falling back to minimal .env defaults."
+    write_env_fallback "$env_file"
+    CURRENT_ENV_FILE="$env_file"
+    return 0
+  fi
+  local existing_public_key
+  local existing_private_key
+  local existing_subject
+  local existing_server_port
+  local existing_client_port
+  existing_public_key="$(get_existing_env_value "VAPID_PUBLIC_KEY" "")"
+  existing_private_key="$(get_existing_env_value "VAPID_PRIVATE_KEY" "")"
+  existing_subject="$(get_existing_env_value "VAPID_SUBJECT" "mailto:admin@example.com")"
+  existing_server_port="$(get_existing_env_value_with_fallback "SERVER_PORT" "PORT" "$DEFAULT_SERVER_PORT")"
+  existing_client_port="$(get_existing_env_value "CLIENT_PORT" "$DEFAULT_CLIENT_PORT")"
+
+  run_silent run_as_root cp "$example_file" "$env_file"
+  replace_env_value "$env_file" "SERVER_PORT" "$existing_server_port"
+  replace_env_value "$env_file" "CLIENT_PORT" "$existing_client_port"
+  replace_env_value "$env_file" "SERVER_PORT" "$SERVER_PORT"
+  replace_env_value "$env_file" "CLIENT_PORT" "$CLIENT_PORT"
+  replace_env_value "$env_file" "ACCOUNT_CREATION" "$ACCOUNT_CREATION"
+  replace_env_value "$env_file" "FILE_UPLOAD" "$FILE_UPLOAD"
+  replace_env_value "$env_file" "FILE_UPLOAD_MAX_TOTAL_SIZE" "$MAX_UPLOAD"
+  replace_env_value "$env_file" "MESSAGE_FILE_RETENTION" "$RETENTION_DAYS"
+  replace_env_value "$env_file" "VAPID_PUBLIC_KEY" "$existing_public_key"
+  replace_env_value "$env_file" "VAPID_PRIVATE_KEY" "$existing_private_key"
+  if [[ -n "$CERTBOT_EMAIL" ]]; then
+    replace_env_value "$env_file" "VAPID_SUBJECT" "mailto:${CERTBOT_EMAIL}"
+  else
+    replace_env_value "$env_file" "VAPID_SUBJECT" "$existing_subject"
+  fi
+  CURRENT_ENV_FILE="$env_file"
+  log "Wrote environment config from ${example_file}."
+}
+
+write_env_fallback() {
+  local env_file="$1"
+  local existing_public_key
+  local existing_private_key
+  local existing_subject
+  existing_public_key="$(get_existing_env_value "VAPID_PUBLIC_KEY" "")"
+  existing_private_key="$(get_existing_env_value "VAPID_PRIVATE_KEY" "")"
+  existing_subject="$(get_existing_env_value "VAPID_SUBJECT" "mailto:admin@example.com")"
+  run_silent run_as_root bash -lc "cat > '$env_file' <<'EOF'
+SERVER_PORT=${SERVER_PORT}
+CLIENT_PORT=${CLIENT_PORT}
 APP_ENV=production
 APP_DEBUG=false
+ACCOUNT_CREATION=${ACCOUNT_CREATION}
 FILE_UPLOAD=${FILE_UPLOAD}
-FILE_UPLOAD_MAX_SIZE=$(get_existing_env_value "FILE_UPLOAD_MAX_SIZE" "26214400")
-FILE_UPLOAD_MAX_TOTAL_SIZE=$(get_existing_env_value "FILE_UPLOAD_MAX_TOTAL_SIZE" "78643200")
-FILE_UPLOAD_MAX_FILES=$(get_existing_env_value "FILE_UPLOAD_MAX_FILES" "10")
-FILE_UPLOAD_TRANSCODE_VIDEOS=$(get_existing_env_value "FILE_UPLOAD_TRANSCODE_VIDEOS" "true")
+FILE_UPLOAD_MAX_SIZE=26214400
+FILE_UPLOAD_MAX_TOTAL_SIZE=${MAX_UPLOAD}
+FILE_UPLOAD_MAX_FILES=10
+FILE_UPLOAD_TRANSCODE_VIDEOS=true
 MESSAGE_FILE_RETENTION=${RETENTION_DAYS}
-CHAT_PENDING_TEXT_TIMEOUT=$(get_existing_env_value "CHAT_PENDING_TEXT_TIMEOUT" "300000")
-CHAT_PENDING_FILE_TIMEOUT=$(get_existing_env_value "CHAT_PENDING_FILE_TIMEOUT" "1200000")
-CHAT_PENDING_RETRY_INTERVAL=$(get_existing_env_value "CHAT_PENDING_RETRY_INTERVAL" "4000")
-CHAT_PENDING_STATUS_CHECK_INTERVAL=$(get_existing_env_value "CHAT_PENDING_STATUS_CHECK_INTERVAL" "1000")
-CHAT_MESSAGE_FETCH_LIMIT=$(get_existing_env_value "CHAT_MESSAGE_FETCH_LIMIT" "300")
-CHAT_MESSAGE_PAGE_SIZE=$(get_existing_env_value "CHAT_MESSAGE_PAGE_SIZE" "60")
-CHAT_LIST_REFRESH_INTERVAL=$(get_existing_env_value "CHAT_LIST_REFRESH_INTERVAL" "20000")
-CHAT_PRESENCE_PING_INTERVAL=$(get_existing_env_value "CHAT_PRESENCE_PING_INTERVAL" "5000")
-CHAT_PEER_PRESENCE_POLL_INTERVAL=$(get_existing_env_value "CHAT_PEER_PRESENCE_POLL_INTERVAL" "3000")
-CHAT_HEALTH_CHECK_INTERVAL=$(get_existing_env_value "CHAT_HEALTH_CHECK_INTERVAL" "10000")
-CHAT_SSE_RECONNECT_DELAY=$(get_existing_env_value "CHAT_SSE_RECONNECT_DELAY" "2000")
-CHAT_SEARCH_MAX_RESULTS=$(get_existing_env_value "CHAT_SEARCH_MAX_RESULTS" "5")
-EOF
+MESSAGE_MAX_CHARS=4000
+CHAT_PENDING_TEXT_TIMEOUT=300000
+CHAT_PENDING_FILE_TIMEOUT=1200000
+CHAT_PENDING_RETRY_INTERVAL=4000
+CHAT_PENDING_STATUS_CHECK_INTERVAL=1000
+CHAT_CACHE_TTL=24
+CHAT_MESSAGE_FETCH_LIMIT=300
+CHAT_MESSAGE_PAGE_SIZE=60
+CHAT_LIST_REFRESH_INTERVAL=20000
+CHAT_PRESENCE_PING_INTERVAL=5000
+CHAT_PEER_PRESENCE_POLL_INTERVAL=3000
+CHAT_HEALTH_CHECK_INTERVAL=10000
+CHAT_SSE_RECONNECT_DELAY=2000
+CHAT_SEARCH_MAX_RESULTS=5
+NICKNAME_MAX=24
+USERNAME_MAX=16
+VAPID_PUBLIC_KEY=${existing_public_key}
+VAPID_PRIVATE_KEY=${existing_private_key}
+VAPID_SUBJECT=${existing_subject}
+EOF"
+  if [[ -n "$CERTBOT_EMAIL" ]]; then
+    replace_env_value "$env_file" "VAPID_SUBJECT" "mailto:${CERTBOT_EMAIL}"
+  fi
+  log "Wrote fallback environment config to ${env_file}."
+}
+
+ensure_vapid_keys() {
+  local env_file="${INSTALL_DIR}/.env"
+  local public_key
+  local private_key
+  public_key="$(get_existing_env_value "VAPID_PUBLIC_KEY" "")"
+  private_key="$(get_existing_env_value "VAPID_PRIVATE_KEY" "")"
+  if [[ -n "$public_key" && -n "$private_key" ]]; then
+    log "VAPID keys already present. Skipping generation."
+    return 0
+  fi
+  log "Generating VAPID keys..."
+  local keys
+  keys="$(run_as_root_output bash -lc "cd '$INSTALL_DIR/server' && node --input-type=module -e \"import pkg from 'web-push'; const { generateVAPIDKeys } = pkg; const k = generateVAPIDKeys(); console.log(k.publicKey); console.log(k.privateKey);\"")" || {
+    warn "Failed to generate VAPID keys. Make sure server dependencies are installed."
+    return 1
+  }
+  local new_public=""
+  local new_private=""
+  IFS=$'\n' read -r new_public new_private _ <<< "$keys"
+  if [[ -z "$new_public" || -z "$new_private" ]]; then
+    return 1
+  fi
+  replace_env_value "$env_file" "VAPID_PUBLIC_KEY" "$new_public"
+  replace_env_value "$env_file" "VAPID_PRIVATE_KEY" "$new_private"
+  log "VAPID keys generated and saved to ${env_file}."
 }
 
 open_env_editor() {
@@ -417,8 +912,6 @@ open_env_editor() {
   fi
 
   log "Opening ${env_file} with ${editor_cmd}. Save and close to continue."
-  tput rmcup
-  trap 'tput rmcup' EXIT INT TERM  
 
   if [[ -n "$SUDO" ]]; then
     $SUDO "$editor_cmd" "$env_file"
@@ -426,17 +919,17 @@ open_env_editor() {
     "$editor_cmd" "$env_file"
   fi
 
-  tput smcup
   clear
-  trap 'tput rmcup' EXIT INT TERM
 }
 
 sync_values_from_env() {
   local env_file="$INSTALL_DIR/.env"
-  APP_PORT="$(get_existing_env_value "PORT" "$DEFAULT_PORT")"
+  SERVER_PORT="$(get_existing_env_value_with_fallback "SERVER_PORT" "PORT" "$DEFAULT_SERVER_PORT")"
+  CLIENT_PORT="$(get_existing_env_value "CLIENT_PORT" "$DEFAULT_CLIENT_PORT")"
   FILE_UPLOAD="$(get_existing_env_value "FILE_UPLOAD" "$DEFAULT_FILE_UPLOAD")"
   MAX_UPLOAD="$(get_existing_env_value "FILE_UPLOAD_MAX_TOTAL_SIZE" "$DEFAULT_MAX_UPLOAD")"
   RETENTION_DAYS="$(get_existing_env_value "MESSAGE_FILE_RETENTION" "$DEFAULT_RETENTION_DAYS")"
+  ACCOUNT_CREATION="$(get_existing_env_value "ACCOUNT_CREATION" "$DEFAULT_ACCOUNT_CREATION")"
   CURRENT_ENV_FILE="$env_file"
 }
 
@@ -494,7 +987,18 @@ collect_install_options() {
   fi
 
 
-  APP_PORT="$(prompt_port)"
+  SERVER_PORT="$(prompt_port)"
+  if [[ "$DEPLOY_MODE" == "ip" ]]; then
+    CLIENT_PORT="$(prompt_client_port)"
+  else
+    CLIENT_PORT="$DEFAULT_CLIENT_PORT"
+  fi
+
+  if [[ "$(prompt_yes_no "Allow account creation via website?" "yes")" == "yes" ]]; then
+    ACCOUNT_CREATION="true"
+  else
+    ACCOUNT_CREATION="false"
+  fi
 
   if [[ "$(prompt_yes_no "Enable file uploads?" "yes")" == "yes" ]]; then
     FILE_UPLOAD="true"
@@ -507,15 +1011,12 @@ collect_install_options() {
   else
     RETENTION_DAYS="0"
   fi
+
 }
 
 write_full_env_with_defaults() {
-  local env_file="${INSTALL_DIR}/.env"
   run_silent run_as_root mkdir -p "$INSTALL_DIR"
-  run_silent run_as_root touch "$env_file"
-  render_full_env_file "$env_file"
-  CURRENT_ENV_FILE="$env_file"
-  log "Wrote full environment config to ${env_file}."
+  write_env_from_example
 }
 
 apply_ownership() {
@@ -554,12 +1055,12 @@ configure_nginx() {
   log "Creating Nginx config at ${NGINX_SITE_FILE}..."
   run_silent run_as_root tee "$NGINX_SITE_FILE" >/dev/null <<EOF
 server {
-  listen 80 default_server;
+  listen ${CLIENT_PORT} default_server;
   ${server_name_line}
   client_max_body_size ${MAX_UPLOAD};
 
   location /api/events {
-    proxy_pass http://127.0.0.1:${APP_PORT};
+    proxy_pass http://127.0.0.1:${SERVER_PORT};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
@@ -573,7 +1074,7 @@ server {
   }
 
   location / {
-    proxy_pass http://127.0.0.1:${APP_PORT};
+    proxy_pass http://127.0.0.1:${SERVER_PORT};
     proxy_http_version 1.1;
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -651,6 +1152,49 @@ configure_ssl_if_needed() {
   log "Nginx SSL configured for: ${DOMAIN_NAMES[*]}"
 }
 
+restore_backup_if_provided() {
+  if [[ -z "$DB_BACKUP_PATH" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$DB_BACKUP_PATH" ]]; then
+    warn "Backup file not found: $DB_BACKUP_PATH"
+    return 1
+  fi
+  if ! have_cmd unzip; then
+    fail "unzip is required to restore backups. Install it first and retry."
+  fi
+  if ! validate_backup_zip "$DB_BACKUP_PATH"; then
+    fail "Backup validation failed."
+  fi
+
+  log "Restoring data from backup: $DB_BACKUP_PATH"
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  local source_dir
+  source_dir="$(extract_backup_zip "$DB_BACKUP_PATH" "$tmp_dir")" || {
+    run_silent run_as_root rm -rf "$tmp_dir"
+    fail "Backup zip does not contain expected songbird.db and uploads/ directory."
+  }
+
+  local db_src="$source_dir/songbird.db"
+  local uploads_src="$source_dir/uploads"
+
+  run_silent run_as_root rm -rf "$INSTALL_DIR/data"
+  run_silent run_as_root mkdir -p "$INSTALL_DIR/data"
+
+  if [[ -f "$db_src" ]]; then
+    run_silent run_as_root cp -a "$db_src" "$INSTALL_DIR/data/"
+  fi
+  if [[ -d "$uploads_src" ]]; then
+    run_silent run_as_root cp -a "$uploads_src" "$INSTALL_DIR/data/"
+  fi
+
+  run_silent run_as_root rm -rf "$tmp_dir"
+  log "Backup restored into ${INSTALL_DIR}/data."
+  apply_ownership
+}
+
 backup_database() {
   if [[ ! -d "$INSTALL_DIR/server" ]]; then
     warn "Server directory not found; skipping DB backup."
@@ -671,33 +1215,66 @@ run_migrations() {
   run_in_install_dir "npm --prefix server run db:migrate"
 }
 
+update_nginx_runtime_values() {
+  if [[ ! -f "$NGINX_SITE_FILE" ]]; then
+    warn "Nginx site config not found at ${NGINX_SITE_FILE}. Skipping nginx update."
+    return 1
+  fi
+
+  local backup_file="${NGINX_SITE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  run_silent run_as_root cp "$NGINX_SITE_FILE" "$backup_file"
+
+  run_silent run_as_root sed -i -E \
+    "s|proxy_pass http://127\\.0\\.0\\.1:[0-9]+;|proxy_pass http://127.0.0.1:${SERVER_PORT};|g" \
+    "$NGINX_SITE_FILE"
+
+  run_silent run_as_root sed -i -E \
+    "s|listen [0-9]+ default_server;|listen ${CLIENT_PORT} default_server;|g" \
+    "$NGINX_SITE_FILE"
+
+  run_silent run_as_root sed -i -E \
+    "s|client_max_body_size [^;]+;|client_max_body_size ${MAX_UPLOAD};|g" \
+    "$NGINX_SITE_FILE"
+
+  if run_as_root nginx -t; then
+    run_as_root systemctl reload nginx
+    log "Nginx updated with SERVER_PORT=${SERVER_PORT}, CLIENT_PORT=${CLIENT_PORT}, MAX_UPLOAD=${MAX_UPLOAD}."
+    log "Backup saved at ${backup_file}."
+    return 0
+  fi
+
+  warn "Nginx config test failed. Restoring previous config."
+  run_silent run_as_root cp "$backup_file" "$NGINX_SITE_FILE"
+  run_as_root nginx -t || true
+  return 1
+}
+
 rebuild_and_restart_after_settings_change() {
+  local needs_nginx="${1:-no}"
   sync_values_from_env
   log "Rebuilding client after settings change..."
-    run_in_install_dir "npm --prefix client run build"
+  run_in_install_dir "npm --prefix client run build"
 
   log "Restarting Songbird service..."
   run_as_root systemctl restart songbird.service
 
-  log "Regenerating Nginx config to align with current PORT (${APP_PORT})..."
-  if [[ -f "$NGINX_SITE_FILE" ]]; then
-    # Preserve currently deployed server_name from existing config when possible.
-    local existing_server_name
-    existing_server_name="$(run_as_root awk '/^[[:space:]]*server_name[[:space:]]+/ { gsub(/;/, "", $0); sub(/^[[:space:]]*server_name[[:space:]]+/, "", $0); print; exit }' "$NGINX_SITE_FILE" || true)"
-    if [[ -n "$existing_server_name" ]]; then
-      NGINX_SERVER_NAME="$existing_server_name"
-    fi
+  if [[ "$needs_nginx" == "yes" ]]; then
+    log "Updating Nginx config for SERVER_PORT/CLIENT_PORT/MAX_UPLOAD changes..."
+    update_nginx_runtime_values || warn "Nginx update failed. Review ${NGINX_SITE_FILE}."
+  else
+    log "Nginx update not required (SERVER_PORT/CLIENT_PORT/MAX_UPLOAD unchanged)."
   fi
-  configure_nginx
-  configure_ssl_if_needed
 }
 
 update_songbird() {
-  [[ -d "$INSTALL_DIR/.git" ]] || fail "No Songbird install found at ${INSTALL_DIR}."
-
+  [[ -d "$INSTALL_DIR" ]] || fail "No Songbird install found at ${INSTALL_DIR}."
   backup_database
 
   local before after
+  before=""
+  after=""
+
+  [[ -d "$INSTALL_DIR/.git" ]] || fail "No git checkout found at ${INSTALL_DIR}. Update requires GitHub mode."
   before="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
 
   run_in_install_dir "git fetch --all --prune"
@@ -713,6 +1290,7 @@ update_songbird() {
 
   log "New version detected. Installing dependencies..."
   install_songbird_dependencies
+  ensure_vapid_keys
   run_migrations
   apply_ownership
 
@@ -735,7 +1313,27 @@ restart_songbird() {
 
 edit_settings() {
   local env_file="${INSTALL_DIR}/.env"
-  [[ -f "$env_file" ]] || fail "No .env found at ${env_file}. Run install first."
+  if [[ ! -f "$env_file" ]]; then
+    warn "No .env found at ${env_file}. Run install first."
+    press_enter_to_continue
+    return 0
+  fi
+
+  local legacy_port existing_server existing_client
+  legacy_port="$(get_existing_env_value "PORT" "")"
+  existing_server="$(get_existing_env_value "SERVER_PORT" "")"
+  existing_client="$(get_existing_env_value "CLIENT_PORT" "")"
+  if [[ -n "$legacy_port" && -z "$existing_server" ]]; then
+    replace_env_value "$env_file" "SERVER_PORT" "$legacy_port"
+  fi
+  if [[ -z "$existing_client" ]]; then
+    replace_env_value "$env_file" "CLIENT_PORT" "$DEFAULT_CLIENT_PORT"
+  fi
+
+  local before_server before_client before_max
+  before_server="$(get_existing_env_value_with_fallback "SERVER_PORT" "PORT" "$DEFAULT_SERVER_PORT")"
+  before_client="$(get_existing_env_value "CLIENT_PORT" "$DEFAULT_CLIENT_PORT")"
+  before_max="$(get_existing_env_value "FILE_UPLOAD_MAX_TOTAL_SIZE" "$DEFAULT_MAX_UPLOAD")"
 
   local before after
   before="$(sha256sum "$env_file" | awk '{print $1}')"
@@ -749,8 +1347,18 @@ edit_settings() {
     return 0
   fi
 
+  local after_server after_client after_max
+  after_server="$(get_existing_env_value_with_fallback "SERVER_PORT" "PORT" "$DEFAULT_SERVER_PORT")"
+  after_client="$(get_existing_env_value "CLIENT_PORT" "$DEFAULT_CLIENT_PORT")"
+  after_max="$(get_existing_env_value "FILE_UPLOAD_MAX_TOTAL_SIZE" "$DEFAULT_MAX_UPLOAD")"
+
+  local needs_nginx="no"
+  if [[ "$before_server" != "$after_server" || "$before_client" != "$after_client" || "$before_max" != "$after_max" ]]; then
+    needs_nginx="yes"
+  fi
+
   log "Changes detected. Applying updates..."
-  rebuild_and_restart_after_settings_change
+  rebuild_and_restart_after_settings_change "$needs_nginx"
   log "Settings applied."
   press_enter_to_continue
 }
@@ -774,7 +1382,9 @@ remove_songbird() {
     run_as_root systemctl reload nginx
   fi
 
-  run_as_root rm -rf "$INSTALL_DIR"
+  if [[ -d "$INSTALL_DIR" ]]; then
+    run_as_root rm -rf "$INSTALL_DIR"
+  fi
   if id -u "$SERVICE_USER" >/dev/null 2>&1; then
     run_as_root userdel "$SERVICE_USER" || true
   fi
@@ -811,13 +1421,20 @@ check_for_updates_notice() {
 
 install_songbird() {
   ensure_log_dir
+  prompt_source_mode
   collect_install_options
   install_required_packages
   ensure_nodejs_from_nodesource
   ensure_service_user_exists
+  if [[ "$SOURCE_MODE" == "offline" ]]; then
+    ensure_offline_source_ready "install" || return 0
+  else
+    clone_repo
+  fi
+  restore_backup_if_provided
   write_full_env_with_defaults
-  clone_repo
   install_songbird_dependencies
+  ensure_vapid_keys
   apply_ownership
   configure_systemd_service
   configure_nginx
@@ -830,7 +1447,7 @@ install_songbird() {
       log "Visit: https://${d}"
     done
   else
-    log "Visit: http://<your-server-ip>"
+    log "Visit: http://<your-server-ip>:${CLIENT_PORT}"
   fi
 
   press_enter_to_continue
@@ -877,41 +1494,6 @@ ensure_global_command_on_first_run() {
   if ! install_global_command; then
     warn "Automatic global command installation failed. You can retry from the menu."
   fi
-}
-
-configure_mirrors() {
-  printf "\nMirror Configuration\n"
-  printf "Leave blank to keep current value.\n\n"
-
-  local val=""
-
-  prompt_read "Nodejs mirror base URL (current: ${MIRROR_NODESOURCE:-<default NodeSource>}): " val
-  val="${val#"${val%%[![:space:]]*}"}"
-  val="${val%"${val##*[![:space:]]}"}"
-  if [[ -n "$val" ]]; then
-    MIRROR_NODESOURCE="$val"
-    log "NodeSource mirror set to: ${MIRROR_NODESOURCE}"
-  fi
-
-  prompt_read "Extra apt source line for packages (current: ${MIRROR_APT_EXTRA:-<none>}): " val
-  val="${val#"${val%%[![:space:]]*}"}"
-  val="${val%"${val##*[![:space:]]}"}"
-  if [[ -n "$val" ]]; then
-    MIRROR_APT_EXTRA="$val"
-    log "Apt mirror source set to: ${MIRROR_APT_EXTRA}"
-  fi
-
-  prompt_read "npm mirror registry URL (current: ${MIRROR_NPM:-<default registry.npmjs.org>}): " val
-  val="${val#"${val%%[![:space:]]*}"}"
-  val="${val%"${val##*[![:space:]]}"}"
-  if [[ -n "$val" ]]; then
-    MIRROR_NPM="$val"
-    log "npm mirror set to: ${MIRROR_NPM}"
-  fi
-
-  printf "\nMirror settings updated (active for this session).\n"
-  printf "To persist them, export MIRROR_NODESOURCE and MIRROR_APT_EXTRA before launching.\n"
-  press_enter_to_continue
 }
 
 show_logs() {
@@ -987,15 +1569,16 @@ show_menu() {
   show_banner
   printf "\n"
   printf "Songbird Deploy Menu\n"
-  printf "1) Install Songbird\n"
-  printf "2) Update Songbird\n"
-  printf "3) Restart Songbird\n"
-  printf "4) Edit Settings (.env)\n"
-  printf "5) Remove Songbird\n"
-  printf "6) Reinstall global command (songbird-deploy)\n"
-  printf "7) Configure mirrors\n"
-  printf "8) View Logs\n"
-  printf "9) Exit\n\n"
+  printf $'1) 📥  Install Songbird\n'
+  printf $'2) 🔄️  Update Songbird\n'
+  printf $'3) ♻️  Restart Songbird\n'
+  printf $'4) ⚙️  Edit Settings (.env)\n'
+  printf $'5) 🗃️  Manage Database\n'
+  printf $'6) 🗑️  Remove Songbird\n'
+  printf $'7) 🔄️  Reinstall global command (songbird-deploy)\n'
+  printf $'8) 🌐  Configure mirrors\n'
+  printf $'9) 📋  View Logs\n'
+  printf $'10) 🚪  Exit\n\n'
 }
 
 show_logs_menu() {
@@ -1004,11 +1587,11 @@ show_logs_menu() {
     show_banner
     printf "\n"
     printf "Logs Menu\n"
-    printf "1) View script logs\n"
-    printf "2) View service logs\n"
-    printf "3) View nginx access logs\n"
-    printf "4) View nginx error logs\n"
-    printf "5) Go back\n\n"
+    printf $'1) 📋  View script logs\n'
+    printf $'2) 📋  View service logs\n'
+    printf $'3) 📋 View nginx access logs\n'
+    printf $'4) 📋  View nginx error logs\n'
+    printf $'5) ↩️  Go back\n\n'
 
     prompt_read "Choose an option [1-5]: " choice
     case "$choice" in
@@ -1022,6 +1605,248 @@ show_logs_menu() {
   done
 }
 
+run_db_command() {
+  local args=("$@")
+  local escaped=""
+  local part=""
+  for part in "${args[@]}"; do
+    escaped+=" $(printf '%q' "$part")"
+  done
+  run_as_root bash -lc "cd '$INSTALL_DIR' && ${escaped:1}"
+}
+
+db_backup() {
+  log "Creating backup (db + uploads)..."
+  run_db_command npm --prefix server run db:backup
+  press_enter_to_continue
+}
+
+db_inspect() {
+  local kind="$1"
+  local limit=""
+  prompt_read "Enter row limit (default: 25): " limit
+  limit="${limit#"${limit%%[![:space:]]*}"}"
+  limit="${limit%"${limit##*[![:space:]]}"}"
+  [[ -z "$limit" ]] && limit="25"
+
+  case "$kind" in
+    all) run_db_command npm --prefix server run db:inspect -- --limit "$limit" ;;
+    chat) run_db_command npm --prefix server run db:chat:inspect -- --limit "$limit" ;;
+    user) run_db_command npm --prefix server run db:user:inspect -- --limit "$limit" ;;
+    file) run_db_command npm --prefix server run db:file:inspect -- --limit "$limit" ;;
+  esac
+  press_enter_to_continue
+}
+
+db_reset() {
+  if [[ "$(prompt_yes_no "This will reset database and delete uploads. Continue?" "no")" != "yes" ]]; then
+    log "Reset canceled."
+    return 0
+  fi
+  local recreate="yes"
+  if [[ "$(prompt_yes_no "Recreate a fresh database after reset?" "yes")" != "yes" ]]; then
+    recreate="no"
+  fi
+
+  if [[ "$recreate" == "yes" ]]; then
+    run_db_command npm --prefix server run db:reset -- -y --recreate
+  else
+    run_db_command npm --prefix server run db:reset -- -y --no-recreate
+  fi
+  press_enter_to_continue
+}
+
+db_delete() {
+  if [[ "$(prompt_yes_no "This will permanently delete database and uploads. Continue?" "no")" != "yes" ]]; then
+    log "Delete canceled."
+    return 0
+  fi
+  run_db_command npm --prefix server run db:delete -- -y
+  press_enter_to_continue
+}
+
+db_chat_delete() {
+  local input=""
+  prompt_read "Enter chat IDs (comma/space separated) or type 'all': " input
+  input="$(printf "%s" "$input" | tr ',' ' ')"
+  input="${input#"${input%%[![:space:]]*}"}"
+  input="${input%"${input##*[![:space:]]}"}"
+
+  if [[ -z "$input" ]]; then
+    printf "No input provided.\n"
+    return 0
+  fi
+
+  if [[ "${input,,}" == "all" ]]; then
+    run_db_command npm --prefix server run db:chat:delete -- --all -y
+  else
+    run_db_command npm --prefix server run db:chat:delete -- -y $input
+  fi
+  press_enter_to_continue
+}
+
+db_file_delete() {
+  local input=""
+  prompt_read "Enter file IDs or stored names (comma/space separated) or type 'all': " input
+  input="$(printf "%s" "$input" | tr ',' ' ')"
+  input="${input#"${input%%[![:space:]]*}"}"
+  input="${input%"${input##*[![:space:]]}"}"
+
+  if [[ -z "$input" ]]; then
+    printf "No input provided.\n"
+    return 0
+  fi
+
+  if [[ "${input,,}" == "all" ]]; then
+    run_db_command npm --prefix server run db:file:delete -- -y
+  else
+    run_db_command npm --prefix server run db:file:delete -- -y $input
+  fi
+  press_enter_to_continue
+}
+
+db_user_delete() {
+  local input=""
+  prompt_read "Enter user IDs or usernames (comma/space separated) or type 'all': " input
+  input="$(printf "%s" "$input" | tr ',' ' ')"
+  input="${input#"${input%%[![:space:]]*}"}"
+  input="${input%"${input##*[![:space:]]}"}"
+
+  if [[ -z "$input" ]]; then
+    printf "No input provided.\n"
+    return 0
+  fi
+
+  if [[ "${input,,}" == "all" ]]; then
+    run_db_command npm --prefix server run db:user:delete -- --all -y
+  else
+    run_db_command npm --prefix server run db:user:delete -- -y $input
+  fi
+  press_enter_to_continue
+}
+
+db_user_create() {
+  local nickname=""
+  local username=""
+  local password=""
+
+  prompt_read "Display name (optional): " nickname
+  username="$(prompt_non_empty "Username (lowercase letters, numbers, ., _)")"
+  password="$(prompt_secret "Password")"
+
+  run_db_command npm --prefix server run db:user:create -- \
+    --nickname "$nickname" \
+    --username "$username" \
+    --password "$password"
+  press_enter_to_continue
+}
+
+db_user_generate() {
+  local count=""
+  local password=""
+  local nickname_prefix=""
+  local username_prefix=""
+
+  prompt_read "How many users to create? (default: 10): " count
+  count="${count#"${count%%[![:space:]]*}"}"
+  count="${count%"${count##*[![:space:]]}"}"
+  [[ -z "$count" ]] && count="10"
+
+  password="$(prompt_secret "Password for generated users? (default: Passw0rd!)")"
+  [[ -z "$password" ]] && password="Passw0rd!"
+
+  prompt_read "Nickname prefix (default: User): " nickname_prefix
+  nickname_prefix="${nickname_prefix#"${nickname_prefix%%[![:space:]]*}"}"
+  nickname_prefix="${nickname_prefix%"${nickname_prefix##*[![:space:]]}"}"
+  [[ -z "$nickname_prefix" ]] && nickname_prefix="User"
+
+  prompt_read "Username prefix (default: user): " username_prefix
+  username_prefix="${username_prefix#"${username_prefix%%[![:space:]]*}"}"
+  username_prefix="${username_prefix%"${username_prefix##*[![:space:]]}"}"
+  [[ -z "$username_prefix" ]] && username_prefix="user"
+
+  run_db_command npm --prefix server run db:user:generate -- \
+    --count "$count" \
+    --password "$password" \
+    --nickname-prefix "$nickname_prefix" \
+    --username-prefix "$username_prefix"
+  press_enter_to_continue
+}
+
+db_restore_backup() {
+  local backup_input=""
+  while true; do
+    prompt_read "Enter the full path to the backup .zip file: " backup_input
+    if [[ -z "$backup_input" ]]; then
+      printf "Please provide a file path.\n"
+      continue
+    fi
+    local resolved=""
+    resolved="$(resolve_file_path "$backup_input")" || resolved=""
+    if [[ -z "$resolved" ]]; then
+      printf "File not found. Tried: %s\n" "$backup_input"
+      continue
+    fi
+    if [[ "${resolved,,}" != *.zip ]]; then
+      printf "Backup file must be a .zip archive.\n"
+      continue
+    fi
+    if ! validate_backup_zip "$resolved"; then
+      continue
+    fi
+    break
+  done
+
+  if [[ "$(prompt_yes_no "This will replace ${INSTALL_DIR}/data. Continue?" "no")" != "yes" ]]; then
+    log "Restore canceled."
+    return 0
+  fi
+
+  DB_BACKUP_PATH="$resolved"
+  restore_backup_if_provided
+  press_enter_to_continue
+}
+
+show_db_menu() {
+  while true; do
+    clear
+    show_banner
+    printf "\n"
+    printf "Manage Database\n"
+    printf $'1) 👁️  Inspect database (summary)\n'
+    printf $'2) 👁️  Inspect chats metadata\n'
+    printf $'3) 👁️  Inspect users\n'
+    printf $'4) 👁️  Inspect files\n'
+    printf $'5) 📤  Backup database\n'
+    printf $'6) 🔄️  Reset database\n'
+    printf $'7) 🗑️  Delete database\n'
+    printf $'8) 🗑️  Delete chats\n'
+    printf $'9) 🗑️  Delete users\n'
+    printf $'10) 🧹  Delete files\n'
+    printf $'11) 👤  Create user\n'
+    printf $'12) 👥  Generate users (bulk)\n'
+    printf $'13) ↩️  Go back\n\n'
+
+    prompt_read "Choose an option [1-13]: " choice
+    case "$choice" in
+      1) db_inspect "all" ;;
+      2) db_inspect "chat" ;;
+      3) db_inspect "user" ;;
+      4) db_inspect "file" ;;
+      5) db_backup ;;
+      6) db_reset ;;
+      7) db_delete ;;
+      8) db_chat_delete ;;
+      9) db_user_delete ;;
+      10) db_file_delete ;;
+      11) db_user_create ;;
+      12) db_user_generate ;;
+      13) return ;;
+      *) printf "Invalid choice. Select a number from 1 to 13.\n" ;;
+    esac
+  done
+}
+
 main() {
   ensure_log_dir
   init_prompt_io
@@ -1029,26 +1854,26 @@ main() {
   ensure_sudo
   ensure_global_command_on_first_run
 
-  tput smcup
-  trap 'tput rmcup' EXIT INT TERM
+  trap 'handle_exit' EXIT
+  trap 'handle_interrupt' INT TERM
 
   local choice=""
   while true; do
     check_for_updates_notice
-    tput smcup
     show_menu
-    prompt_read "Choose an option [1-9]: " choice
+    prompt_read "Choose an option [1-10]: " choice
     case "$choice" in
       1) install_songbird ;;
       2) update_songbird ;;
       3) restart_songbird ;;
       4) edit_settings ;;
-      5) remove_songbird ;;
-      6) install_global_command ;;
-      7) configure_mirrors ;;
-      8) show_logs_menu ;;
-      9) break ;;
-      *) printf "Invalid choice. Select a number from 1 to 9.\n" ;;
+      5) show_db_menu ;;
+      6) remove_songbird ;;
+      7) install_global_command ;;
+      8) configure_mirrors_menu ;;
+      9) show_logs_menu ;;
+      10) break ;;
+      *) printf "Invalid choice. Select a number from 1 to 10.\n" ;;
     esac
   done
 }

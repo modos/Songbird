@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, Eye, EyeOff, LoaderCircle, Moon, Sun } from "../icons/lucide.js";
+import { NICKNAME_MAX, USERNAME_MAX } from "../utils/nameLimits.js";
 
 export default function AuthCard({
   mode,
@@ -10,11 +11,15 @@ export default function AuthCard({
   status,
   loading,
   showSigningOverlay = false,
+  allowSignup = true,
 }) {
   const isLogin = mode === "login";
+  const canSignup = Boolean(allowSignup);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [themeToggleAnimating, setThemeToggleAnimating] = useState(false);
+  const [nicknameLength, setNicknameLength] = useState(0);
+  const [usernameLength, setUsernameLength] = useState(0);
   const themeAnimTimeoutRef = useRef(null);
 
   useEffect(() => {
@@ -65,19 +70,35 @@ export default function AuthCard({
         </button>
       </div>
 
-      <form className="mt-4 space-y-3 sm:mt-6 sm:space-y-4" onSubmit={onSubmit}>
-        {!isLogin ? (
+      <form
+        className="mt-4 space-y-3 sm:mt-6 sm:space-y-4"
+        onSubmit={onSubmit}
+        onReset={() => {
+          setNicknameLength(0);
+          setUsernameLength(0);
+        }}
+      >
+        {!isLogin && canSignup ? (
           <label className="block">
             <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 sm:text-sm">
               Nickname
             </span>
-            <input
-              name="nickname"
-              type="text"
-              required
-              placeholder="Songbird Sage"
-              className="mt-1 w-full rounded-2xl border border-emerald-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-950 dark:text-slate-100 sm:mt-2 sm:px-4 sm:py-3 sm:text-sm"
-            />
+            <div className="relative mt-1 sm:mt-2">
+              <input
+                name="nickname"
+                type="text"
+                required
+                placeholder="Songbird Sage"
+                maxLength={NICKNAME_MAX}
+                onInput={(event) =>
+                  setNicknameLength(String(event.currentTarget.value || "").length)
+                }
+                className="w-full rounded-2xl border border-emerald-200 bg-white px-3 py-2 pr-14 text-xs text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-950 dark:text-slate-100 sm:px-4 sm:py-3 sm:text-sm"
+              />
+              <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-slate-400 dark:text-slate-500 sm:text-[11px]">
+                {nicknameLength}/{NICKNAME_MAX}
+              </span>
+            </div>
           </label>
         ) : null}
 
@@ -85,16 +106,27 @@ export default function AuthCard({
           <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 sm:text-sm">
             Username
           </span>
-          <input
-            name="username"
-            type="text"
-            required
-            pattern="[a-zA-Z0-9._]+"
-            title="Use english letters, numbers, dot (.), and underscore (_)."
-            autoCapitalize="none"
-            placeholder="songbird.sage"
-            className="mt-1 w-full rounded-2xl border border-emerald-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-950 dark:text-slate-100 sm:mt-2 sm:px-4 sm:py-3 sm:text-sm"
-          />
+          <div className="relative mt-1 sm:mt-2">
+            <input
+              name="username"
+              type="text"
+              required
+              pattern="[a-zA-Z0-9._]+"
+              title="Use english letters, numbers, dot (.), and underscore (_)."
+              autoCapitalize="none"
+              placeholder="songbird.sage"
+              maxLength={USERNAME_MAX}
+              onInput={(event) =>
+                setUsernameLength(String(event.currentTarget.value || "").length)
+              }
+              className="w-full rounded-2xl border border-emerald-200 bg-white px-3 py-2 pr-14 text-xs text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-950 dark:text-slate-100 sm:px-4 sm:py-3 sm:text-sm"
+            />
+            {!isLogin && canSignup ? (
+              <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-slate-400 dark:text-slate-500 sm:text-[11px]">
+                {usernameLength}/{USERNAME_MAX}
+              </span>
+            ) : null}
+          </div>
         </label>
 
         <label className="block">
@@ -121,7 +153,7 @@ export default function AuthCard({
           </div>
         </label>
 
-        {!isLogin ? (
+        {!isLogin && canSignup ? (
           <label className="block">
             <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 sm:text-sm">
               Confirm password
@@ -164,18 +196,20 @@ export default function AuthCard({
         </p>
       ) : null}
 
-      <div className="mt-4 space-y-2 rounded-2xl border border-emerald-100/70 bg-emerald-50/70 p-3 text-xs text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-900/40 dark:text-emerald-200 sm:mt-6 sm:space-y-3 sm:p-4 sm:text-sm">
-        <p className="font-semibold">
-          {isLogin ? "Don't have an account?" : "Already have an account?"}
-        </p>
-        <button
-          type="button"
-          onClick={onSwitchMode}
-          className="mt-2 w-full rounded-2xl border border-emerald-300 bg-white/80 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:border-emerald-400 hover:shadow-[0_0_18px_rgba(16,185,129,0.24)] dark:border-emerald-500/40 dark:bg-slate-900/60 dark:text-emerald-200 sm:px-4 sm:py-2 sm:text-sm"
-        >
-          {isLogin ? "Create new account" : "Back to sign in"}
-        </button>
-      </div>
+      {canSignup ? (
+        <div className="mt-4 space-y-2 rounded-2xl border border-emerald-100/70 bg-emerald-50/70 p-3 text-xs text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-900/40 dark:text-emerald-200 sm:mt-6 sm:space-y-3 sm:p-4 sm:text-sm">
+          <p className="font-semibold">
+            {isLogin ? "Don't have an account?" : "Already have an account?"}
+          </p>
+          <button
+            type="button"
+            onClick={onSwitchMode}
+            className="mt-2 w-full rounded-2xl border border-emerald-300 bg-white/80 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:border-emerald-400 hover:shadow-[0_0_18px_rgba(16,185,129,0.24)] dark:border-emerald-500/40 dark:bg-slate-900/60 dark:text-emerald-200 sm:px-4 sm:py-2 sm:text-sm"
+          >
+            {isLogin ? "Create new account" : "Back to sign in"}
+          </button>
+        </div>
+      ) : null}
       {showSigningOverlay && isLogin ? (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 rounded-3xl bg-white/85 backdrop-blur-sm dark:bg-slate-950/85">
           <LoaderCircle className="h-12 w-12 animate-spin text-emerald-500" />

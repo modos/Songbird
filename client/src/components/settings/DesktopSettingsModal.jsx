@@ -1,9 +1,12 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Close, Eye, EyeOff, Trash, Upload } from "../../icons/lucide.js";
 import { getAvatarStyle } from "../../utils/avatarColor.js";
 import { hasPersian } from "../../utils/fontUtils.js";
 import { getAvatarInitials } from "../../utils/avatarInitials.js";
+import { NICKNAME_MAX, USERNAME_MAX } from "../../utils/nameLimits.js";
 import { InlineError } from "./InlineError.jsx";
+import { DataSettingsPanel } from "./DataSettingsPanel.jsx";
+import ConfirmPasswordModal from "../ConfirmPasswordModal.jsx";
 
 export function DesktopSettingsModal({
   settingsPanel,
@@ -23,26 +26,38 @@ export function DesktopSettingsModal({
   profileError,
   passwordError,
   fileUploadEnabled,
+  onClearCache,
+  dataCacheStats,
+  currentUser,
+  onDeleteAccount,
 }) {
   const [showCurrentPassword, setShowCurrentPassword] = useState(false);
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const handleClosePanel = useCallback(() => setSettingsPanel(null), [setSettingsPanel]);
   if (!settingsPanel) return null;
   const resolvedUserColor = userColor || "#10b981";
   const profileIdentity = profileForm.nickname || profileForm.username || "S";
   const profileInitials = getAvatarInitials(profileIdentity);
+  const nicknameLength = String(profileForm.nickname || "").length;
+  const usernameLength = String(profileForm.username || "").length;
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-6">
       <div className="w-full max-w-md rounded-2xl border border-emerald-100/70 bg-white p-6 shadow-xl dark:border-emerald-500/30 dark:bg-slate-950">
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-semibold text-emerald-700 dark:text-emerald-200">
-            {settingsPanel === "profile" ? "Edit profile" : "Security"}
+            {settingsPanel === "profile"
+              ? "Edit profile"
+              : settingsPanel === "security"
+                ? "Security"
+                : "Data"}
           </h3>
           <button
             type="button"
-            onClick={() => setSettingsPanel(null)}
-            className="flex items-center justify-center rounded-full border border-emerald-200 p-2 text-emerald-700 transition hover:bg-emerald-50 hover:shadow-[0_0_16px_rgba(16,185,129,0.2)] dark:border-emerald-500/30 dark:text-emerald-200 dark:hover:bg-emerald-500/10"
+            onClick={handleClosePanel}
+            className="flex items-center justify-center rounded-full border border-rose-200 p-2 text-rose-600 transition hover:border-rose-300 hover:bg-rose-50 hover:shadow-[0_0_16px_rgba(244,63,94,0.2)] dark:border-rose-500/30 dark:text-rose-200 dark:hover:bg-rose-500/10"
           >
             <Close size={18} className="icon-anim-pop" />
           </button>
@@ -111,34 +126,46 @@ export function DesktopSettingsModal({
               <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
                 Nickname
               </span>
-              <input
-                value={profileForm.nickname}
-                onChange={(event) =>
-                  setProfileForm((prev) => ({
-                    ...prev,
-                    nickname: event.target.value,
-                  }))
-                }
-                className="mt-2 w-full rounded-2xl border border-emerald-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-slate-100"
-              />
+              <div className="relative mt-2">
+                <input
+                  value={profileForm.nickname}
+                  onChange={(event) =>
+                    setProfileForm((prev) => ({
+                      ...prev,
+                      nickname: event.target.value,
+                    }))
+                  }
+                  maxLength={NICKNAME_MAX}
+                  className="w-full rounded-2xl border border-emerald-200 bg-white px-4 py-3 pr-16 text-sm text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-slate-100"
+                />
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-slate-400 dark:text-slate-500">
+                  {nicknameLength}/{NICKNAME_MAX}
+                </span>
+              </div>
             </label>
             <label className="block">
               <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
                 Username
               </span>
-              <input
-                value={profileForm.username}
-                onChange={(event) =>
-                  setProfileForm((prev) => ({
-                    ...prev,
-                    username: event.target.value,
-                  }))
-                }
-                pattern="[a-zA-Z0-9._]+"
-                title="Use english letters, numbers, dot (.), and underscore (_)."
-                autoCapitalize="none"
-                className="mt-2 w-full rounded-2xl border border-emerald-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-slate-100"
-              />
+              <div className="relative mt-2">
+                <input
+                  value={profileForm.username}
+                  onChange={(event) =>
+                    setProfileForm((prev) => ({
+                      ...prev,
+                      username: event.target.value,
+                    }))
+                  }
+                  maxLength={USERNAME_MAX}
+                  pattern="[a-zA-Z0-9._]+"
+                  title="Use english letters, numbers, dot (.), and underscore (_)."
+                  autoCapitalize="none"
+                  className="w-full rounded-2xl border border-emerald-200 bg-white px-4 py-3 pr-16 text-sm text-slate-700 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-300/60 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-slate-100"
+                />
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-slate-400 dark:text-slate-500">
+                  {usernameLength}/{USERNAME_MAX}
+                </span>
+              </div>
             </label>
             <div>
               <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
@@ -163,7 +190,20 @@ export function DesktopSettingsModal({
                   </button>
                 ))}
               </div>
+              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                Invisible makes you appear offline to others.
+              </p>
             </div>
+            {onDeleteAccount ? (
+              <button
+                type="button"
+                onClick={() => setDeleteModalOpen(true)}
+                className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-rose-200/80 bg-rose-50/70 px-4 py-3 text-sm font-semibold text-rose-600 transition hover:border-rose-300 hover:bg-rose-100 dark:border-rose-500/40 dark:bg-rose-900/30 dark:text-rose-200 dark:hover:bg-rose-900/50"
+              >
+                <Trash size={16} className="icon-anim-sway" />
+                Delete account
+              </button>
+            ) : null}
             <button
               type="submit"
               className="w-full rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-emerald-500/30 transition hover:bg-emerald-400 hover:shadow-[0_0_20px_rgba(16,185,129,0.4)]"
@@ -288,7 +328,31 @@ export function DesktopSettingsModal({
             <InlineError message={passwordError} />
           </form>
         ) : null}
+
+        {settingsPanel === "data" ? (
+          <div className="mt-4">
+            <DataSettingsPanel
+              dataCacheStats={dataCacheStats}
+              onClearCache={onClearCache}
+              onClose={handleClosePanel}
+              user={currentUser}
+              variant="desktop"
+            />
+          </div>
+        ) : null}
       </div>
+
+      <ConfirmPasswordModal
+        open={deleteModalOpen}
+        title="Delete account"
+        description="This permanently deletes your account, removes your messages, and transfers or deletes any groups/channels you own."
+        confirmLabel="Continue"
+        deleteLabel="Delete"
+        onClose={() => setDeleteModalOpen(false)}
+        onConfirm={async (password) => {
+          await onDeleteAccount?.(password);
+        }}
+      />
     </div>
   );
 }

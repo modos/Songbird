@@ -71,13 +71,15 @@ export function MessageTimeline({
                 </span>
               </button>
             </div>
-            {group.items.map((msg, index) => (
-              <div
-                key={String(msg?._clientId ?? msg?.id ?? `single-msg-${index}`)}
-              >
-                {renderMessageItem(msg, { isFirstInGroup: index === 0 })}
-              </div>
-            ))}
+            {group.items.map((msg, index) => {
+              const stableKey =
+                msg?._clientId ?? msg?._serverId ?? msg?.id ?? `msg-${groupIndex}-${index}`;
+              return (
+                <div key={stableKey}>
+                  {renderMessageItem(msg, { isFirstInGroup: index === 0 })}
+                </div>
+              );
+            })}
           </div>
         ))}
         <div style={{ height: `${timelineBottomSpacerPx}px` }} />

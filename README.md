@@ -294,9 +294,17 @@ sudo systemctl reload nginx
 
 #### 3. Get SSL for domain
 
+Request ssl from certbot:
+
 ```bash
 sudo certbot --nginx -d example.com -d www.example.com
 sudo certbot renew --dry-run
+```
+
+Or if you are sure you already have ssl for your domain, use this command to only install the certificate on your nginx config:
+
+```bash
+sudo certbot install --nginx --cert-name example.com www.example.com 
 ```
 
 ### Option B: Server IP (HTTP)
@@ -355,15 +363,30 @@ sudo ufw enable
 ```
 
 > **NOTE:**
-> - If you set `PORT` to a different value, update `proxy_pass` accordingly.
+> - If you set `SERVER_PORT` to a different value, update `proxy_pass` accordingly.
+> - If you use HTTP, nginx port doesn't have to be `80` .
 > - Keep `client_max_body_size` aligned with `FILE_UPLOAD_MAX_TOTAL_SIZE` (total request size).
-> - Keep the dedicated `/api/events` block as shown so SSE remains truly realtime behind HTTPS reverse proxies.
 
 ## Common troubleshooting
 
-- Docker logs: `docker compose -f docker-compose.yaml logs -f`
-- systemd service logs: `sudo journalctl -u songbird -f`
-- Check Nginx error logs: `/var/log/nginx/error.log`
+- Docker logs: 
+
+```bash
+docker compose -f docker-compose.yaml logs -f
+```
+
+- systemd service logs:
+
+```bash
+sudo journalctl -u songbird -f
+```
+
+- Check Nginx error logs:
+
+```bash
+nano /var/log/nginx/error.log
+```
+
 - If Docker build looks stuck at `RUN npm ci`, it is usually downloading dependencies. Use plain progress for visibility:
 
 ```bash
@@ -376,26 +399,30 @@ You can configure environment variables to customize app behavior.
 
 ```bash
 cd /opt/songbird
-nano .env
+cp .env.example .env
 ```
 
 ### Configurable values:
 
 | Variable | Type | Default | Description |
 |---|---|---:|---|
-| `PORT` | `integer` | `5174` | API server port. Use the same value in Nginx `proxy_pass`. |
+| `SERVER_PORT` | `integer` | `5174` | API server port. (`PORT` is supported as a legacy fallback.) |
+| `CLIENT_PORT` | `integer` | `80` | Nginx listen port (what users connect to). |
 | `APP_ENV` | `string` | `production` | Server runtime mode (`production` recommended/default). |
 | `APP_DEBUG` | `boolean` | `false` | Enable verbose server debug logs in terminal/stdout (`[app-debug]` lines for message send/upload/transcode/metadata events). |
+| `ACCOUNT_CREATION` | `boolean` | `true` | Allow new accounts to be created via the website (`/signup`). |
 | `FILE_UPLOAD` | `boolean` | `true` | Enable/disable all uploads globally (chat files + avatars). |
 | `FILE_UPLOAD_MAX_SIZE` | `integer` | `26214400` | Per-file upload max size (bytes). |
 | `FILE_UPLOAD_MAX_TOTAL_SIZE` | `integer` | `78643200` | Per-message total upload size cap (bytes). |
 | `FILE_UPLOAD_MAX_FILES` | `integer` | `10` | Max uploaded files in one message. |
 | `FILE_UPLOAD_TRANSCODE_VIDEOS` | `boolean` | `true` | Convert uploaded videos to H.264/AAC MP4 and keep only the converted file. Requires `ffmpeg`. |
 | `MESSAGE_FILE_RETENTION` | `integer` | `7` | Auto-delete uploaded message files after N days (`0` disables). |
+| `MESSAGE_MAX_CHARS` | `integer` | `4000` | Max message length. |
 | `CHAT_PENDING_TEXT_TIMEOUT` | `integer` | `300000` | Mark pending text message as failed after this timeout (milliseconds). |
 | `CHAT_PENDING_FILE_TIMEOUT` | `integer` | `1200000` | Mark pending file message as failed / XHR timeout for uploads (milliseconds). |
 | `CHAT_PENDING_RETRY_INTERVAL` | `integer` | `4000` | Retry cadence for pending sends while connected (milliseconds). |
 | `CHAT_PENDING_STATUS_CHECK_INTERVAL` | `integer` | `1000` | How often pending messages are checked for timeout (milliseconds). |
+| `CHAT_CACHE_TTL` | `integer` | `24` | Local cache time-to-live for chat lists and message caches (hours). |
 | `CHAT_MESSAGE_FETCH_LIMIT` | `integer` | `300` | Max messages requested per chat fetch (initial/latest window). |
 | `CHAT_MESSAGE_PAGE_SIZE` | `integer` | `60` | Page size for loading older messages when scrolling to top. |
 | `CHAT_LIST_REFRESH_INTERVAL` | `integer` | `20000` | Chats list background refresh interval (milliseconds). |
@@ -403,7 +430,14 @@ nano .env
 | `CHAT_PEER_PRESENCE_POLL_INTERVAL` | `integer` | `3000` | Active peer presence poll interval (milliseconds). |
 | `CHAT_HEALTH_CHECK_INTERVAL` | `integer` | `10000` | Connection health check interval (milliseconds). |
 | `CHAT_SSE_RECONNECT_DELAY` | `integer` | `2000` | Delay before reconnecting SSE after error (milliseconds). |
-| `CHAT_SEARCH_MAX_RESULTS` | `integer` | `5` | Max users shown in user search results (New DM/New Group) and member list page size (`Show more`) in Group Profile. |
+| `CHAT_SEARCH_MAX_RESULTS` | `integer` | `5` | Max users shown in search results. |
+| `NICKNAME_MAX` | `integer` | `24` | Max nickname length for users and groups. |
+| `USERNAME_MAX` | `integer` | `16` | Max username length for users and groups. |
+| `VAPID_PUBLIC_KEY` | `string` | `-` | Web Push public key (required for push notifications). |
+| `VAPID_PRIVATE_KEY` | `string` | `-` | Web Push private key (required for push notifications). |
+| `VAPID_SUBJECT` | `string` | `mailto:admin@example.com` | Contact for VAPID (email or URL). Used by push providers. |
+
+> **Push notifications require HTTPS** (except `localhost` for development). iOS requires an installed PWA (iOS 16.4+).
 
 ### Apply Changes:
 
@@ -500,9 +534,9 @@ For zero-downtime deployments on larger projects, consider blue-green deployment
 - Run migrations: `npm run db:migrate`
 - Reset DB: `npm run db:reset`
 - Delete DB: `npm run db:delete`
-- Delete chats (all or selected ids): `npm run db:chat:delete`
+- Delete chats (all or selected ids): `npm run db:chat:delete` (requires `--all` to delete everything)
 - Delete files (all or selected ids/filenames): `npm run db:file:delete`
-- Delete users (all or selected ids/usernames): `npm run db:user:delete`
+- Delete users (all or selected ids/usernames): `npm run db:user:delete` (requires `--all` to delete everything)
 - Create one user: `npm run db:user:create`
 - Generate random users: `npm run db:user:generate`
 - Generate random chat messages for a chat between two users: `npm run db:message:generate`
@@ -527,10 +561,12 @@ cd server
 npm run db:reset -y
 npm run db:delete --yes
 npm run db:chat:delete 12 -y
+npm run db:chat:delete -- --all -y
 npm run db:file:delete -y
 npm run db:file:delete 42 -y
 npm run db:file:delete FILE_NAME -y
 npm run db:user:delete songbird.sage -y
+npm run db:user:delete -- --all -y
 ```
 
 DB admin scripts now support both modes:
@@ -552,7 +588,11 @@ Generate random users:
 
 ```bash
 cd server
-npm run db:user:generate -- --count 50 --password "12345678"
+# npm may warn about unknown cli config if you omit "--".
+# This works reliably:
+npm run db:user:generate -- --count=50 --password="12345678"
+# (legacy form still supported if npm allows it):
+# npm run db:user:generate -- --count 50 --password "12345678"
 ```
 
 Generate random messages in one chat between two users:
@@ -600,6 +640,34 @@ If you plan to host the app at a subpath (e.g., `example.com/songbird/`) you wil
 - Contributions are welcome.
 - If you want to contribute, contact the maintainer first by opening an issue at: `https://github.com/bllackbull/Songbird/issues`
 - For direct coordination, reach out to [@bllackbull](https://github.com/bllackbull) on GitHub before opening a PR.
+
+## Support
+
+If you like this project which I hope you do, consider supporting your favorite project:
+
+### TRX:
+
+```
+TPf1bEhipKpGkjo5N2Scj9nufNNh5TNrwX
+```
+
+### USDT (TRC20):
+
+```
+0x63313383611BbE11f4fEc139c14ad0b70281b822
+```
+
+### BTC:
+
+```
+bc1q9hupvcc39juhf0k7rgzn6phn8s8jez365kzmuj
+```
+
+### TON:
+
+```
+UQDzQ3xbWzKQvw8X8sWU82dksBeYqTHrT9sLzhBOyaESPjVy
+```
 
 ## License
 

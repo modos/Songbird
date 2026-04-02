@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
+  Bookmark,
   Chat,
   Close,
   Copy,
+  LogIn,
   LogOut,
   Pencil,
   Users,
@@ -31,44 +33,66 @@ export default function ChatProfileModal({
   onRemoveMember,
   onEditGroup,
   onEditSelfProfile,
+  showJoinAction = false,
+  onJoinChat,
+  showMembers = true,
+  readOnly = false,
   membersBatchSize = MEMBERS_BATCH_SIZE,
 }) {
   const [memberQuery, setMemberQuery] = useState("");
   const [memberLimit, setMemberLimit] = useState(membersBatchSize);
   const [copiedInviteLink, setCopiedInviteLink] = useState(false);
-  useEffect(() => {
-    if (!open) {
-      setMemberQuery("");
-      setMemberLimit(membersBatchSize);
-      setCopiedInviteLink(false);
-    }
-  }, [open, membersBatchSize]);
+  const handleClose = () => {
+    setMemberQuery("");
+    setMemberLimit(membersBatchSize);
+    setCopiedInviteLink(false);
+    onClose?.();
+  };
 
   const isGroup = chat?.type === "group";
+  const isChannel = chat?.type === "channel";
+  const isSaved = chat?.type === "saved";
   const isSelfProfile =
     !isGroup &&
+    !isChannel &&
+    !isSaved &&
     String(targetUser?.username || "").toLowerCase() ===
       String(currentUser?.username || "").toLowerCase();
-  const profileName = isGroup
-    ? chat?.name || "Group"
-    : targetUser?.nickname || targetUser?.username || "User";
-  const profileUsername = isGroup
+  const profileName = isGroup || isChannel
+    ? chat?.name || (isChannel ? "Channel" : "Group")
+    : isSaved
+      ? "Saved messages"
+      : targetUser?.nickname || targetUser?.username || "User";
+  const profileUsername = isGroup || isChannel
     ? chat?.group_username || ""
-    : targetUser?.username || "";
-  const profileAvatarUrl = isGroup
+    : isSaved
+      ? ""
+      : targetUser?.username || "";
+  const profileAvatarUrl = isGroup || isChannel
     ? chat?.group_avatar_url || null
-    : targetUser?.avatar_url || null;
-  const profileColor = isGroup
+    : isSaved
+      ? null
+      : targetUser?.avatar_url || null;
+  const profileColor = isGroup || isChannel
     ? chat?.group_color || "#10b981"
-    : targetUser?.color || "#10b981";
+    : isSaved
+      ? "#10b981"
+      : targetUser?.color || "#10b981";
   const initials = getAvatarInitials(profileName);
   const members = Array.isArray(chat?.members) ? chat.members : [];
+  const membersCountRaw = Number(chat?.membersCount);
+  const membersCount = Number.isFinite(membersCountRaw)
+    ? membersCountRaw
+    : members.length;
   const ownerId = Number(
     members.find(
       (member) => String(member.role || "").toLowerCase() === "owner",
     )?.id || 0,
   );
   const isOwner = Number(currentUser?.id || 0) === ownerId;
+  const isReadOnly = Boolean(readOnly);
+  const canSeeMembers =
+    showMembers && !isReadOnly && (isGroup || (isChannel && isOwner));
 
   const sortedMembers = useMemo(() => {
     const query = memberQuery.trim().toLowerCase();
@@ -112,16 +136,16 @@ export default function ChatProfileModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-5">
       <div className="app-scroll max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-3xl border border-emerald-100/70 bg-white p-5 shadow-xl dark:border-emerald-500/30 dark:bg-slate-950">
         <div className="mb-3 flex items-center justify-between">
-          {isGroup && isOwner ? (
+          {!isReadOnly && (isGroup || isChannel) && isOwner ? (
             <button
               type="button"
               onClick={onEditGroup}
               className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-emerald-200 dark:hover:bg-emerald-500/10"
-              aria-label="Edit group"
+              aria-label={isChannel ? "Edit channel" : "Edit group"}
             >
               <Pencil size={16} className="icon-anim-sway" />
             </button>
-          ) : isSelfProfile ? (
+          ) : !isReadOnly && isSelfProfile ? (
             <button
               type="button"
               onClick={onEditSelfProfile}
@@ -133,14 +157,14 @@ export default function ChatProfileModal({
           ) : (
             <span />
           )}
-          <button
-            type="button"
-            onClick={onClose}
-            className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-emerald-200 dark:hover:bg-emerald-500/10"
-            aria-label="Close profile"
-          >
-            <Close size={16} className="icon-anim-pop" />
-          </button>
+            <button
+              type="button"
+              onClick={handleClose}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-rose-200 bg-white text-rose-600 transition hover:border-rose-300 hover:bg-rose-50 dark:border-rose-500/30 dark:bg-slate-900 dark:text-rose-200 dark:hover:bg-rose-500/10"
+              aria-label="Close profile"
+            >
+              <Close size={16} className="icon-anim-pop" />
+            </button>
         </div>
 
         <div className="text-center">
@@ -155,28 +179,51 @@ export default function ChatProfileModal({
               className={`mx-auto flex h-20 w-20 items-center justify-center rounded-full text-2xl font-bold ${hasPersian(initials) ? "font-fa" : ""}`}
               style={getAvatarStyle(profileColor)}
             >
-              {initials}
+              {isSaved ? <Bookmark size={24} className="text-white" /> : initials}
             </div>
           )}
           <p
             className={`mt-3 text-lg font-semibold ${hasPersian(profileName) ? "font-fa" : ""}`}
+            dir="auto"
+            style={{ unicodeBidi: "plaintext" }}
           >
             {profileName}
           </p>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            @{profileUsername}
-          </p>
-          {isGroup ? (
-            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              {members.length} members
+          {profileUsername ? (
+            <p
+              className="max-w-full truncate text-sm text-slate-500 dark:text-slate-400"
+              dir="auto"
+              title={profileUsername}
+            >
+              @{profileUsername}
             </p>
           ) : null}
+        {isGroup || isChannel ? (
+          <p className={`mt-1 whitespace-nowrap text-slate-500 dark:text-slate-400 ${
+            membersCount >= 1_000_000 ? "text-[10px] sm:text-xs" : "text-xs"
+          }`}>
+            {membersCount.toLocaleString("en-US")} members
+          </p>
+        ) : null}
         </div>
 
-        {!isSelfProfile ? (
+        {showJoinAction ? (
+          <div className="mt-4 grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={onJoinChat}
+              className="group col-start-2 rounded-2xl border border-emerald-200 bg-white px-2 py-3 text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-50 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-emerald-200 dark:hover:bg-emerald-500/10"
+            >
+              <div className="mx-auto inline-flex h-11 w-11 items-center justify-center rounded-full">
+                <LogIn size={24} className="icon-anim-bob" />
+              </div>
+              <p className="mt-1 text-xs font-semibold">Join</p>
+            </button>
+          </div>
+        ) : !isReadOnly && !isSelfProfile && !isSaved ? (
           <div
             className={`mt-4 ${
-              isGroup
+              isGroup || isChannel
                 ? "grid grid-cols-3 gap-2"
                 : "mx-auto grid w-full max-w-[18rem] grid-cols-2 gap-2"
             }`}
@@ -207,7 +254,7 @@ export default function ChatProfileModal({
                 {muted ? "Unmute" : "Mute"}
               </p>
             </button>
-            {isGroup ? (
+            {isGroup || isChannel ? (
               <button
                 type="button"
                 onClick={onLeaveGroup}
@@ -222,7 +269,7 @@ export default function ChatProfileModal({
           </div>
         ) : null}
 
-        {isGroup && canViewInvite ? (
+        {!isReadOnly && (isGroup || isChannel) && canViewInvite ? (
           <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3 dark:border-emerald-500/30 dark:bg-emerald-500/10">
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-200">
@@ -265,7 +312,7 @@ export default function ChatProfileModal({
           </div>
         ) : null}
 
-        {isGroup ? (
+        {canSeeMembers ? (
           <div className="mt-4 rounded-2xl border border-emerald-200/80 p-3 dark:border-emerald-500/30">
             <div className="relative">
               <input
@@ -281,7 +328,7 @@ export default function ChatProfileModal({
                 <button
                   type="button"
                   onClick={() => setMemberQuery("")}
-                  className="absolute right-1 top-1/2 inline-flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-transparent bg-transparent text-emerald-700 transition hover:bg-emerald-100 hover:shadow-[0_0_18px_rgba(16,185,129,0.22)] dark:text-emerald-200 dark:hover:bg-emerald-500/10"
+                  className="absolute right-1 top-1/2 inline-flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-transparent bg-transparent text-rose-600 transition hover:bg-rose-100 hover:shadow-[0_0_18px_rgba(244,63,94,0.22)] dark:text-rose-200 dark:hover:bg-rose-500/10"
                 >
                   <Close size={14} className="icon-anim-pop" />
                 </button>
@@ -321,6 +368,8 @@ export default function ChatProfileModal({
                       <div className="min-w-0">
                         <p
                           className={`truncate text-sm font-semibold ${hasPersian(label) ? "font-fa" : ""}`}
+                          dir="auto"
+                          title={label}
                         >
                           {label}
                         </p>

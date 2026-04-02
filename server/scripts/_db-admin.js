@@ -1,8 +1,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import initSqlJs from 'sql.js'
+import dotenv from 'dotenv'
 import { dataDir, serverDir } from './_cli.js'
 import { migrations } from '../migrations/index.js'
+
+dotenv.config({ path: path.join(serverDir, '..', '.env') })
+dotenv.config({ path: path.join(serverDir, '.env'), override: true })
 
 export const dbPath = path.join(dataDir, 'songbird.db')
 export const uploadsDir = path.join(dataDir, 'uploads', 'messages')
@@ -170,7 +174,7 @@ export function chunkArray(items = [], size = 500) {
 }
 
 export async function detectRunningServer() {
-  const port = Number(process.env.PORT || 5174)
+  const port = Number(process.env.SERVER_PORT || process.env.PORT || 5174)
   const timeoutMs = 600
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)

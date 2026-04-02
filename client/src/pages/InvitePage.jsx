@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { LoaderCircle, Moon, Sun, Users } from "../icons/lucide.js";
+import { LoaderCircle, Moon, Sun, Users, LogIn } from "../icons/lucide.js";
 import { getGroupInviteInfo, joinGroupByInvite } from "../api/chatApi.js";
 import { getAvatarStyle } from "../utils/avatarColor.js";
 import { getAvatarInitials } from "../utils/avatarInitials.js";
@@ -105,7 +105,8 @@ export default function InvitePage({
     await handleJoin();
   };
 
-  const groupName = group?.name || "Group";
+  const groupType = group?.type === "channel" ? "Channel" : "Group";
+  const groupName = group?.name || groupType;
   const groupInitials = getAvatarInitials(groupName);
   const rawGroupAvatarUrl = String(group?.avatarUrl || "").trim();
   const groupAvatarUrl = rawGroupAvatarUrl.startsWith("/uploads/")
@@ -116,10 +117,10 @@ export default function InvitePage({
     <section className="app-scroll relative my-auto w-full max-w-md max-h-[calc(100dvh-5.5rem)] overflow-y-auto rounded-3xl border border-emerald-200/70 bg-white/80 p-6 shadow-2xl shadow-emerald-500/10 backdrop-blur dark:border-white/5 dark:bg-slate-900/80 sm:max-h-none sm:overflow-visible sm:p-8">
       <div className="relative text-center">
         <p className="text-xs font-semibold uppercase tracking-[0.25em] text-emerald-600 dark:text-emerald-300 sm:text-sm">
-          Group Invite
+          {groupType} Invite
         </p>
         <h1 className="mt-2 text-2xl font-bold sm:mt-3 sm:text-3xl">
-          Join Group
+          Join {groupType}
         </h1>
         <button
           type="button"
@@ -171,10 +172,18 @@ export default function InvitePage({
                   {groupInitials}
                 </div>
               )}
-              <p className="text-base font-semibold text-emerald-800 dark:text-emerald-200">
+              <p
+                className="truncate text-base font-semibold text-emerald-800 dark:text-emerald-200"
+                dir="auto"
+                title={groupName}
+              >
                 {groupName}
               </p>
-              <p className="mt-1 text-xs text-slate-600 dark:text-slate-300">
+              <p
+                className="mt-1 truncate text-xs text-slate-600 dark:text-slate-300"
+                dir="auto"
+                title={group?.username || "group"}
+              >
                 @{group?.username || "group"}
               </p>
               <p className="mt-1 inline-flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300">
@@ -184,14 +193,14 @@ export default function InvitePage({
             </div>
             <p className="mt-2 text-center text-xs text-slate-500 dark:text-slate-400">
               {alreadyMember
-                ? "You are already a member of this group."
-                : "You are about to join this group. Do you want to continue?"}
+                ? `You are already a member of this ${groupType.toLowerCase()}.`
+                : `You are about to join this ${groupType.toLowerCase()}. Do you want to continue?`}
             </p>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 type="button"
                 onClick={onNavigateChat}
-                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 hover:shadow-[0_0_14px_rgba(148,163,184,0.2)] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800/70"
+                className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 hover:shadow-[0_0_14px_rgba(148,163,184,0.2)] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800/70"
               >
                 Cancel
               </button>
@@ -200,16 +209,16 @@ export default function InvitePage({
                   type="button"
                   onClick={handleJoin}
                   disabled={joining}
-                  className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-emerald-400 disabled:opacity-70"
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 text-sm font-semibold text-white transition hover:bg-emerald-400 disabled:opacity-70"
                 >
                   {joining ? (
                     <LoaderCircle className="h-4 w-4 animate-spin" />
                   ) : (
                     <span className="icon-anim-slide text-base leading-none">
-                      ↪
+                      <LogIn />
                     </span>
                   )}
-                  Join group
+                  Join {groupType.toLowerCase()}
                 </button>
               ) : (
                 <button

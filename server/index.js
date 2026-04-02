@@ -8,6 +8,7 @@ import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
+import webpush from "web-push";
 import { registerApiRoutes } from "./api/index.js";
 import { USER_COLORS, setUserColor } from "./settings/colors.js";
 import { readEnvBool, readEnvInt } from "./settings/env.js";
@@ -17,6 +18,7 @@ import {
   adminGetRow,
   adminRun,
   adminSave,
+  ensureSavedChatForUser,
   clearGroupMemberRemoved,
   createChat,
   createMessageFiles,
@@ -24,6 +26,8 @@ import {
   createSession,
   deleteSession,
   createUser,
+  deleteChatById,
+  deleteUserById,
   findChatById,
   findDmChat,
   findChatByGroupUsername,
@@ -31,7 +35,11 @@ import {
   findMessageById,
   findUserById,
   findUserByUsername,
+  getMessageReadCounts,
+  getMessageAuthors,
+  getMessageReadByUser,
   getMessages,
+  recordMessageReads,
   listMessageFilesByMessageIds,
   markGroupMemberRemoved,
   regenerateGroupInviteToken,
@@ -44,17 +52,26 @@ import {
   listUsers,
   searchUsers,
   searchPublicGroups,
+  searchPublicChannels,
   setChatMuted,
   touchSession,
   updateLastSeen,
   getUserPresence,
   hideChatsForUser,
   markMessagesRead,
+  markMessageRead,
   updateUserPassword,
   updateUserProfile,
   updateUserStatus,
   updateGroupChat,
+  updateChannelChat,
   unhideChat,
+  getChatMemberRole,
+  setChatMemberRole,
+  upsertPushSubscription,
+  deletePushSubscription,
+  listPushSubscriptionsByUserIds,
+  listMutedUserIdsForChat,
 } from "./db.js";
 
 const app = express();
@@ -63,7 +80,97 @@ const projectRootDir = path.resolve(serverDir, "..");
 dotenv.config({ path: path.join(projectRootDir, ".env") });
 dotenv.config({ path: path.join(serverDir, ".env"), override: true });
 
-const port = process.env.PORT || 5174;
+function updateEnvValue(envPath, key, value) {
+  const safeValue = String(value ?? "");
+  let contents = "";
+  try {
+    contents = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
+  } catch (_) {
+    contents = "";
+  }
+  const lines = contents ? contents.split(/\r?\n/) : [];
+  let found = false;
+  const updated = lines.map((line) => {
+    if (line.startsWith(`${key}=`)) {
+      found = true;
+      return `${key}=${safeValue}`;
+    }
+    return line;
+  });
+  if (!found) {
+    updated.push(`${key}=${safeValue}`);
+  }
+  const next = updated.filter((line, idx, arr) => line.length > 0 || idx < arr.length - 1);
+  fs.writeFileSync(envPath, `${next.join("\n")}\n`);
+}
+
+function ensureValidVapidKeys() {
+  const envPath = path.join(projectRootDir, ".env");
+  const subject = String(process.env.VAPID_SUBJECT || "mailto:admin@example.com").trim();
+  let publicKey = String(process.env.VAPID_PUBLIC_KEY || "").trim();
+  let privateKey = String(process.env.VAPID_PRIVATE_KEY || "").trim();
+
+  const decodeBase64Url = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    try {
+      return Buffer.from(raw, "base64url");
+    } catch {
+      try {
+        const padded = raw.replace(/-/g, "+").replace(/_/g, "/");
+        return Buffer.from(padded, "base64");
+      } catch {
+        return null;
+      }
+    }
+  };
+
+  const isValidVapidPublicKey = (value) => {
+    const decoded = decodeBase64Url(value);
+    return decoded && decoded.length === 65;
+  };
+
+  const isValidVapidPrivateKey = (value) => {
+    const decoded = decodeBase64Url(value);
+    return decoded && decoded.length === 32;
+  };
+
+  const tryValidate = () => {
+    if (!publicKey || !privateKey) return false;
+    if (!isValidVapidPublicKey(publicKey) || !isValidVapidPrivateKey(privateKey)) {
+      return false;
+    }
+    try {
+      webpush.setVapidDetails(subject, publicKey, privateKey);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  if (tryValidate()) {
+    return { publicKey, privateKey, subject };
+  }
+
+  const keys = webpush.generateVAPIDKeys();
+  publicKey = keys.publicKey;
+  privateKey = keys.privateKey;
+  try {
+    updateEnvValue(envPath, "VAPID_PUBLIC_KEY", publicKey);
+    updateEnvValue(envPath, "VAPID_PRIVATE_KEY", privateKey);
+    if (!String(process.env.VAPID_SUBJECT || "").trim()) {
+      updateEnvValue(envPath, "VAPID_SUBJECT", subject);
+    }
+  } catch (error) {
+    console.warn("[push] Unable to update .env with regenerated VAPID keys:", String(error?.message || error));
+  }
+  process.env.VAPID_PUBLIC_KEY = publicKey;
+  process.env.VAPID_PRIVATE_KEY = privateKey;
+  process.env.VAPID_SUBJECT = subject;
+  return { publicKey, privateKey, subject };
+}
+
+const port = process.env.SERVER_PORT || process.env.PORT || 5174;
 const appEnv = process.env.APP_ENV || "production";
 const isProduction = appEnv === "production";
 const APP_DEBUG = readEnvBool("APP_DEBUG", false);
@@ -145,6 +252,19 @@ const staticLimiter = rateLimit({
 });
 
 const USERNAME_REGEX = /^[a-z0-9._]+$/;
+const USERNAME_MAX = readEnvInt("USERNAME_MAX", 16, { min: 3, max: 32 });
+const NICKNAME_MAX = readEnvInt("NICKNAME_MAX", 24, { min: 3, max: 64 });
+const MESSAGE_MAX_CHARS = readEnvInt(
+  ["MESSAGE_MAX_CHARS", "MESSAGE_MAX"],
+  4000,
+  { min: 1, max: 20000 },
+);
+const ACCOUNT_CREATION = readEnvBool("ACCOUNT_CREATION", true);
+const vapid = ensureValidVapidKeys();
+const VAPID_PUBLIC_KEY = String(vapid.publicKey || "").trim();
+const VAPID_PRIVATE_KEY = String(vapid.privateKey || "").trim();
+const VAPID_SUBJECT = String(vapid.subject || "mailto:admin@example.com").trim();
+const PUSH_ENABLED = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
 const sseClientsByUsername = new Map();
 const dataDir = path.resolve(serverDir, "..", "data");
 const uploadRootDir = path.join(dataDir, "uploads", "messages");
@@ -286,7 +406,10 @@ app.get("/api/uploads/messages/:storedName", (req, res) => {
     res.type(mimeType);
   }
 
-  if (!SAFE_INLINE_MESSAGE_EXTENSIONS.has(ext)) {
+  const forceDownload =
+    String(req.query?.download || "").toLowerCase() === "1" ||
+    String(req.query?.download || "").toLowerCase() === "true";
+  if (forceDownload || !SAFE_INLINE_MESSAGE_EXTENSIONS.has(ext)) {
     const encoded = encodeURIComponent(originalName);
     res.setHeader(
       "Content-Disposition",
@@ -416,11 +539,47 @@ function emitChatEvent(chatId, payload) {
   });
 }
 
+if (PUSH_ENABLED) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  } catch (error) {
+    console.error("[push] VAPID setup failed:", String(error?.message || error));
+  }
+}
+
+async function sendPushNotificationToUsers(userIds = [], payload = {}) {
+  if (!PUSH_ENABLED) return;
+  const targets = listPushSubscriptionsByUserIds(userIds);
+  if (!targets.length) return;
+  const body = JSON.stringify(payload || {});
+  await Promise.all(
+    targets.map(async (sub) => {
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: {
+              p256dh: sub.p256dh || "",
+              auth: sub.auth || "",
+            },
+          },
+          body,
+        );
+      } catch (error) {
+        const status = Number(error?.statusCode || 0);
+        if (status === 404 || status === 410) {
+          deletePushSubscription(sub.endpoint);
+        }
+      }
+    }),
+  );
+}
+
 function getUploadKind(uploadType, mimeType = "") {
   const type = String(mimeType || "").toLowerCase();
 
   if (uploadType === "media") {
-    if (type.startsWith("image/") || type.startsWith("video/")) {
+    if (type.startsWith("image/") || type.startsWith("video/") || type.startsWith("audio/")) {
       return "media";
     }
     return null;
@@ -584,10 +743,12 @@ function cleanupMissingMessageFiles(messageIds = []) {
     ),
   );
 
-  if (!normalized.length) return { deletedMessageIds: [], changed: false };
+  if (!normalized.length)
+    return { deletedMessageIds: [], deletedByChat: new Map(), changed: false };
 
   const rows = listMessageFilesByMessageIds(normalized);
-  if (!rows.length) return { deletedMessageIds: [], changed: false };
+  if (!rows.length)
+    return { deletedMessageIds: [], deletedByChat: new Map(), changed: false };
 
   const missingMessageIds = new Set();
 
@@ -603,7 +764,7 @@ function cleanupMissingMessageFiles(messageIds = []) {
   });
 
   if (!missingMessageIds.size) {
-    return { deletedMessageIds: [], changed: false };
+    return { deletedMessageIds: [], deletedByChat: new Map(), changed: false };
   }
 
   const targetMessageIds = Array.from(missingMessageIds);
@@ -613,6 +774,19 @@ function cleanupMissingMessageFiles(messageIds = []) {
     targetMessageIds,
   );
   const storedNames = allFilesRows.map((row) => row.stored_name);
+  const messageChatPairs = adminGetAll(
+    `SELECT id, chat_id FROM chat_messages WHERE id IN (${placeholders})`,
+    targetMessageIds,
+  );
+  const deletedByChat = new Map();
+  messageChatPairs.forEach((row) => {
+    const chatId = Number(row?.chat_id || 0);
+    const messageId = Number(row?.id || 0);
+    if (!chatId || !messageId) return;
+    const list = deletedByChat.get(chatId) || [];
+    list.push(messageId);
+    deletedByChat.set(chatId, list);
+  });
 
   adminRun("BEGIN");
   try {
@@ -638,7 +812,7 @@ function cleanupMissingMessageFiles(messageIds = []) {
   removeStoredFileNames(storedNames);
   adminSave();
 
-  return { deletedMessageIds: targetMessageIds, changed: true };
+  return { deletedMessageIds: targetMessageIds, deletedByChat, changed: true };
 }
 
 function cleanupExpiredMessageFiles() {
@@ -1103,11 +1277,18 @@ function summarizeMessageFiles(rows = []) {
   const imageCount = rows.filter((file) =>
     String(file?.mime_type || "").toLowerCase().startsWith("image/"),
   ).length;
-  const docCount = Math.max(0, rows.length - videoCount - imageCount);
+  const audioCount = rows.filter((file) =>
+    String(file?.mime_type || "").toLowerCase().startsWith("audio/"),
+  ).length;
+  const docCount = Math.max(0, rows.length - videoCount - imageCount - audioCount);
   if (rows.length === 1) {
     if (videoCount === 1) return "Sent a video";
     if (imageCount === 1) return "Sent a photo";
+    if (audioCount === 1) return "Sent a voice message";
     return "Sent a document";
+  }
+  if (audioCount > 0 && videoCount === 0 && imageCount === 0 && docCount === 0) {
+    return `Sent ${audioCount} voice message${audioCount > 1 ? "s" : ""}`;
   }
   if (videoCount > 0 && imageCount === 0 && docCount === 0) {
     return `Sent ${videoCount} video${videoCount > 1 ? "s" : ""}`;
@@ -1506,13 +1687,19 @@ const apiDeps = {
   MESSAGE_FILE_RETENTION_DAYS,
   TRANSCODE_VIDEOS_TO_H264,
   USER_COLORS,
+  NICKNAME_MAX,
+  USERNAME_MAX,
+  MESSAGE_MAX_CHARS,
+  ACCOUNT_CREATION,
   USERNAME_REGEX,
+  VAPID_PUBLIC_KEY: PUSH_ENABLED ? VAPID_PUBLIC_KEY : "",
   addChatMember,
   addSseClient,
   adminGetAll,
   adminGetRow,
   adminRun,
   adminSave,
+  ensureSavedChatForUser,
   avatarUploadRootDir,
   bcrypt,
   buildInspectSnapshot,
@@ -1531,6 +1718,8 @@ const apiDeps = {
   debugLog,
   decodeOriginalFilename,
   deleteSession,
+  deleteChatById,
+  deleteUserById,
   emitChatEvent,
   emitSseEvent,
   enqueueVideoTranscodeJob,
@@ -1544,6 +1733,9 @@ const apiDeps = {
   findUserById,
   findUserByUsername,
   fs,
+  getMessageReadCounts,
+  getMessageAuthors,
+  getMessageReadByUser,
   getMessages,
   getSessionFromRequest,
   getUploadKind,
@@ -1557,12 +1749,17 @@ const apiDeps = {
   isMember,
   isGroupMemberRemoved,
   isVideoFileProcessing,
+  listPushSubscriptionsByUserIds,
   listChatMembers,
   listChatsForUser,
   listMessageFilesByMessageIds,
   listUsers,
+  getChatMemberRole,
+  setChatMemberRole,
+  recordMessageReads,
   markGroupMemberRemoved,
   markMessagesRead,
+  markMessageRead,
   parseCookies,
   parseUploadFileMetadata,
   path,
@@ -1571,6 +1768,7 @@ const apiDeps = {
   removeAllMessageUploads,
   removeAvatarByUrl,
   removeChatMember,
+  deletePushSubscription,
   removeStoredFileNames,
   removeUploadedFiles,
   removeSseClient,
@@ -1580,11 +1778,14 @@ const apiDeps = {
   sanitizePositiveInt,
   searchUsers,
   searchPublicGroups,
+  searchPublicChannels,
   setChatMuted,
+  listMutedUserIdsForChat,
   setSessionCookie,
   setUserColor,
   updateLastSeen,
   updateGroupChat,
+  updateChannelChat,
   unhideChat,
   updateUserPassword,
   updateUserProfile,
@@ -1592,6 +1793,8 @@ const apiDeps = {
   uploadAvatar,
   uploadFiles,
   uploadRootDir,
+  upsertPushSubscription,
+  sendPushNotificationToUsers,
 };
 
 registerApiRoutes(app, apiDeps);
