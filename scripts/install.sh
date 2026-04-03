@@ -634,7 +634,6 @@ clone_repo() {
 
   log "Cloning Songbird repository..."
   run_silent run_as_root git clone "$REPO_URL" "$INSTALL_DIR"
-  ensure_log_dir
 }
 
 prepare_install_dir_for_offline() {
@@ -811,7 +810,7 @@ write_env_from_example() {
   local env_file="${INSTALL_DIR}/.env"
   local example_file="${INSTALL_DIR}/.env.example"
   if [[ ! -f "$example_file" ]]; then
-    warn "Missing ${example_file}. Falling back to minimal .env defaults."
+    log "Missing ${example_file}. Falling back to minimal .env defaults."
     write_env_fallback "$env_file"
     CURRENT_ENV_FILE="$env_file"
     return 0
@@ -1451,7 +1450,6 @@ check_for_updates_notice() {
 }
 
 install_songbird() {
-  ensure_log_dir
   prompt_source_mode
   collect_install_options
   install_required_packages
@@ -1466,6 +1464,7 @@ install_songbird() {
       return 1
     }
   fi
+  ensure_log_dir
   restore_backup_if_provided
   write_full_env_with_defaults
   install_songbird_dependencies
@@ -1883,11 +1882,11 @@ show_db_menu() {
 }
 
 main() {
-  ensure_log_dir
   init_prompt_io
   detect_os
   ensure_sudo
   ensure_global_command_on_first_run
+  ensure_log_dir
   check_for_updates_notice
 
   trap 'handle_exit' EXIT
