@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
+  ArrowDown,
   Bookmark,
   Chat,
   Close,
@@ -42,6 +43,7 @@ export default function ChatProfileModal({
   const [memberQuery, setMemberQuery] = useState("");
   const [memberLimit, setMemberLimit] = useState(membersBatchSize);
   const [copiedInviteLink, setCopiedInviteLink] = useState(false);
+  const membersListRef = useRef(null);
   const handleClose = () => {
     setMemberQuery("");
     setMemberLimit(membersBatchSize);
@@ -335,7 +337,7 @@ export default function ChatProfileModal({
               ) : null}
             </div>
 
-            <div className="app-scroll mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
+            <div className="app-scroll mt-3 max-h-72 space-y-2 overflow-y-auto pr-1" ref={membersListRef}>
               {visibleMembers.map((member) => {
                 const label = member.nickname || member.username;
                 const memberInitials = getAvatarInitials(label);
@@ -398,7 +400,7 @@ export default function ChatProfileModal({
                       <button
                         type="button"
                         onClick={() => onRemoveMember?.(member)}
-                        className="rounded-full border border-rose-200 bg-rose-50 px-2 py-1 text-[10px] font-semibold text-rose-600 transition hover:border-rose-300 dark:border-rose-500/30 dark:bg-rose-900/30 dark:text-rose-200"
+                        className="rounded-full border border-rose-200 bg-rose-50 px-2 py-1 text-[10px] font-semibold text-rose-600 transition hover:border-rose-300 hover:bg-rose-100 hover:shadow-[0_0_14px_rgba(229,62,95,0.2)] dark:border-rose-500/30 dark:bg-rose-900/30 dark:text-rose-200 dark:hover:bg-rose-500/10"
                       >
                         Remove
                       </button>
@@ -411,11 +413,20 @@ export default function ChatProfileModal({
             {hasMoreMembers ? (
               <button
                 type="button"
-                onClick={() =>
-                  setMemberLimit((prev) => prev + membersBatchSize)
-                }
-                className="mt-2 w-full rounded-xl border border-emerald-200 bg-white px-3 py-2 text-xs font-semibold text-emerald-700 transition hover:border-emerald-300 dark:border-emerald-500/30 dark:bg-slate-900 dark:text-emerald-200"
+                onClick={() => {
+                  setMemberLimit((prev) => prev + membersBatchSize);
+                  setTimeout(() => {
+                    if (membersListRef.current) {
+                      membersListRef.current.scrollTo({
+                        top: membersListRef.current.scrollHeight,
+                        behavior: "smooth",
+                      });
+                    }
+                  }, 0);
+                }}
+                className="mt-2 inline-flex w-full items-center justify-center gap-1 rounded-xl border border-emerald-200 bg-white px-3 py-2 text-xs font-semibold text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-50 hover:shadow-[0_0_14px_rgba(16,185,129,0.2)] dark:border-emerald-500/30 dark:bg-slate-900 dark:text-emerald-200 dark:hover:bg-emerald-500/10"
               >
+                <ArrowDown size={12} className="icon-anim-pop" />
                 Show more
               </button>
             ) : null}

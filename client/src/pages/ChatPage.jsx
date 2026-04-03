@@ -976,8 +976,13 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     if (!msg) return;
     const targetId = Number(msg.id || msg._serverId || 0);
     if (!targetId) return;
-    const replyName =
-      msg.nickname || msg.username || msg.replyTo?.nickname || msg.replyTo?.username || "";
+    // In channel chats, show the channel name instead of the message author's name
+    const replyName = isActiveChannelChat
+      ? (activeChat?.name || "Channel")
+      : (msg.nickname || msg.username || msg.replyTo?.nickname || msg.replyTo?.username || "");
+    const replyColor = isActiveChannelChat
+      ? (activeChat?.group_color || "#10b981")
+      : (msg.color || "#10b981");
     const preview = resolveReplyPreview(msg);
     setReplyTarget({
       id: targetId,
@@ -986,7 +991,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       body: preview.text,
       icon: preview.icon,
       displayName: replyName || "Unknown",
-      color: msg.color || "#10b981",
+      color: replyColor,
     });
     if (!userScrolledUpRef.current) {
       pendingScrollToBottomRef.current = true;
@@ -2490,8 +2495,14 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     onPresenceUpdate: (payload) => {
       applyPresenceUpdate(payload);
     },
-    onChatListChanged: () => {
+    onChatListChanged: (payload) => {
+      const deletedChatId = Number(payload?.chatId || 0);
+      const currentActiveId = Number(activeChatIdRef.current || 0);
       setMentionRefreshToken((prev) => prev + 1);
+      // If the deleted/changed chat is the active one, close it
+      if (deletedChatId && deletedChatId === currentActiveId) {
+        closeChat();
+      }
     },
   });
 

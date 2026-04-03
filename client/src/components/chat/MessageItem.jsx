@@ -19,6 +19,8 @@ export function MessageItem({
   isMobileTouchDevice,
   isGroupChat = false,
   isChannelChat = false,
+  chatName = "",
+  chatColor = null,
   seenCount = null,
   onOpenSenderProfile,
   onOpenMention,
@@ -306,8 +308,12 @@ export function MessageItem({
     ? getMessageDayLabel(msg)
     : msg?._dayLabel || msg?._dayKey || "";
   const replyTarget = msg.replyTo || null;
-  const replyDisplayName =
-    replyTarget?.nickname || replyTarget?.username || "Unknown";
+  const replyDisplayName = isChannelChat && replyTarget
+    ? (chatName || "Channel")
+    : (replyTarget?.displayName || replyTarget?.nickname || replyTarget?.username || "Unknown");
+  const replyColor = isChannelChat && replyTarget
+    ? (chatColor || "#10b981")
+    : (replyTarget?.color || "#10b981");
   const replyPreviewRaw = extractBodyText(replyTarget?.body).trim() || "Message";
   const truncateReplyPreview = (value, maxChars = 90) => {
     const text = String(value || "");
@@ -515,7 +521,7 @@ export function MessageItem({
                   <span className="min-w-0 flex-1">
                     <span
                       className="block max-w-full truncate whitespace-nowrap text-[10px] font-semibold"
-                      style={{ color: String(replyTarget?.color || "#10b981") }}
+                      style={{ color: String(replyColor) }}
                       dir="auto"
                       title={replyDisplayName}
                     >
@@ -623,7 +629,7 @@ export function MessageItem({
               <span className="min-w-0 flex-1">
                 <span
                   className="block max-w-full truncate whitespace-nowrap text-[10px] font-semibold"
-                  style={{ color: String(replyTarget?.color || "#10b981") }}
+                  style={{ color: String(replyColor) }}
                   dir="auto"
                   title={replyDisplayName}
                 >
@@ -706,7 +712,16 @@ export function MessageItem({
                             : "text-emerald-900/80 dark:text-emerald-50/80"
                   }`}
                 >
-                  {isChannelChat ? (
+                  {isSending ? (
+                    <Clock12
+                      size={15}
+                      strokeWidth={2.4}
+                      className="animate-spin"
+                      aria-hidden="true"
+                    />
+                  ) : isFailed ? (
+                    <AlertCircle size={15} strokeWidth={2.4} aria-hidden="true" />
+                  ) : isChannelChat ? (
                     <>
                       <Eye
                         size={13}
@@ -716,15 +731,6 @@ export function MessageItem({
                       />
                       <span>{formatSeenCount(seenCount)}</span>
                     </>
-                  ) : isSending ? (
-                    <Clock12
-                      size={15}
-                      strokeWidth={2.4}
-                      className="animate-spin"
-                      aria-hidden="true"
-                    />
-                  ) : isFailed ? (
-                    <AlertCircle size={15} strokeWidth={2.4} aria-hidden="true" />
                   ) : isRead ? (
                     <CheckCheck size={15} strokeWidth={2.5} aria-hidden="true" />
                   ) : (

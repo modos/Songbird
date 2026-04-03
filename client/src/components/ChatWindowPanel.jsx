@@ -593,6 +593,8 @@ export default function ChatWindowPanel({
       onReply={onReplyToMessage}
       isGroupChat={isGroupChat}
       isChannelChat={isChannelChat}
+      chatName={activeFallbackTitle}
+      chatColor={groupAvatarColor}
       seenCount={
         isChannelChat
           ? channelSeenCounts?.[Number(msg?._serverId || msg?.id || 0)] ??
