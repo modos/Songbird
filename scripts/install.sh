@@ -929,7 +929,7 @@ open_env_editor() {
   log "Opening ${env_file} with ${editor_cmd}. Save and close to continue."
 
   if [[ -n "$SUDO" ]]; then
-    $SUDO "$editor_cmd" "$env_file"
+    $SUDO -t "$editor_cmd" "$env_file"
   else
     "$editor_cmd" "$env_file"
   fi
