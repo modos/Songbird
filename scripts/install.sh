@@ -621,10 +621,11 @@ clone_repo() {
     return 0
   fi
 
-  if run_as_root test -n "$(run_as_root_output find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
+  if run_as_root test -n "$(run_as_root_output find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name "logs" ! -name "data" -print -quit)"; then
     if [[ "$(prompt_yes_no "${INSTALL_DIR} exists and is not empty. Delete it and re-clone from GitHub?" "no")" != "yes" ]]; then
-      fail "Installation canceled. Clear ${INSTALL_DIR} or use offline mode."
+      warn "Installation canceled. Clear ${INSTALL_DIR} or use offline mode."
       press_enter_to_continue
+      return 0
     fi
     run_as_root rm -rf "$INSTALL_DIR"
     run_silent run_as_root mkdir -p "$INSTALL_DIR"
@@ -638,7 +639,9 @@ clone_repo() {
 prepare_install_dir_for_offline() {
   run_silent run_as_root mkdir -p "$INSTALL_DIR"
   if run_silent run_as_root test -n "$(run_silent run_as_root find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
-    fail "${INSTALL_DIR} is not empty. Clear it or use another install path for offline mode."
+    warn "${INSTALL_DIR} is not empty. Clear it or use another install path for offline mode."
+    press_enter_to_continue
+    return 0
   fi
 }
 
@@ -1279,15 +1282,25 @@ rebuild_and_restart_after_settings_change() {
 }
 
 update_songbird() {
-  [[ -d "$INSTALL_DIR" ]] || fail "No Songbird install found at ${INSTALL_DIR}."
-  backup_database
+  if [[ -d "$INSTALL_DIR" ]]; then
+    backup_database
+  else
+    warn "No Songbird install found at ${INSTALL_DIR}."
+    press_enter_to_continue
+    return 0
+  fi
 
   local before after
   before=""
   after=""
 
-  [[ -d "$INSTALL_DIR/.git" ]] || fail "No git checkout found at ${INSTALL_DIR}. Update requires GitHub mode."
-  before="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
+  if [[ -d "$INSTALL_DIR/.git" ]]; then
+    before="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
+  else
+    warn "No git checkout found at ${INSTALL_DIR}. Update requires GitHub mode."
+    press_enter_to_continue
+    return 0
+  fi
 
   run_in_install_dir "git fetch --all --prune"
   run_in_install_dir "git checkout main"
@@ -1376,7 +1389,12 @@ edit_settings() {
 }
 
 remove_songbird() {
-  [[ -d "$INSTALL_DIR" ]] || fail "No install found at ${INSTALL_DIR}."
+  if [[ ! -d "$INSTALL_DIR" ]]; then
+    warn "No install found at ${INSTALL_DIR}."
+    press_enter_to_continue
+    return 0
+  fi
+  
   if [[ "$(prompt_yes_no "This will remove Songbird from this server. Continue?" "no")" != "yes" ]]; then
     log "Removal canceled."
     return 0
