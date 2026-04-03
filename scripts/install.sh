@@ -626,16 +626,15 @@ clone_repo() {
   if run_as_root test -n "$(run_as_root_output find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
     if [[ "$(prompt_yes_no "${INSTALL_DIR} exists and is not empty. Delete it and re-clone from GitHub?" "no")" != "yes" ]]; then
       warn "Installation canceled. Clear ${INSTALL_DIR} or use offline mode."
-      press_enter_to_continue
       return 1
     fi
     run_as_root rm -rf "$INSTALL_DIR"
     run_silent run_as_root mkdir -p "$INSTALL_DIR"
-    ensure_log_dir
   fi
 
   log "Cloning Songbird repository..."
   run_silent run_as_root git clone "$REPO_URL" "$INSTALL_DIR"
+  ensure_log_dir
 }
 
 prepare_install_dir_for_offline() {
