@@ -99,18 +99,24 @@ press_enter_to_continue() {
 run_silent() {
   local output
   # Append command being run to log file
-  printf "[%s] Running: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
-  
+  if [[ -f "$LOG_FILE" ]]; then
+    printf "[%s] Running: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+
   if ! output="$("$@" 2>&1)"; then
     # Log the failure
-    printf "[%s] FAILED: %s\n%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$output" >> "$LOG_FILE" 2>/dev/null || true
+    if [[ -f "$LOG_FILE" ]]; then
+      printf "[%s] FAILED: %s\n%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$output" >> "$LOG_FILE" 2>/dev/null || true
+    fi
     # Show error to user
     printf "\n[ERROR] Command failed: %s\n" "$*"
     printf "%s\n" "$output"
     return 1
   else
     # Log success + output
-    printf "[%s] SUCCESS: %s\n%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$output" >> "$LOG_FILE" 2>/dev/null || true
+    if [[ -f "$LOG_FILE" ]]; then
+      printf "[%s] SUCCESS: %s\n%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$output" >> "$LOG_FILE" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -1289,7 +1295,7 @@ update_songbird() {
 
   if [[ "$before" == "$after" ]]; then
     log "Songbird is already up to date. No rebuild needed."
-    return 0
+    press_enter_to_continue
   fi
 
   log "New version detected. Installing dependencies..."
@@ -1857,13 +1863,13 @@ main() {
   detect_os
   ensure_sudo
   ensure_global_command_on_first_run
+  check_for_updates_notice
 
   trap 'handle_exit' EXIT
   trap 'handle_interrupt' INT TERM
 
   local choice=""
   while true; do
-    check_for_updates_notice
     show_menu
     prompt_read "Choose an option [1-10]: " choice
     case "$choice" in
