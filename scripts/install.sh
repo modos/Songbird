@@ -1886,7 +1886,6 @@ main() {
   detect_os
   ensure_sudo
   ensure_global_command_on_first_run
-  ensure_log_dir
   check_for_updates_notice
 
   trap 'handle_exit' EXIT
