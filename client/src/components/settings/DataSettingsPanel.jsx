@@ -172,7 +172,7 @@ export const DataSettingsPanel = memo(function DataSettingsPanel({
               Clear cached data
             </h3>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              This only removes local cached data from this device.
+              This only removes local cached data from this device. You'll need to reload to refresh the cache.
             </p>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button

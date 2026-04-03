@@ -29,6 +29,7 @@ import {
   idbDelete,
   idbGet,
   idbGetAllEntries,
+  idbGetStats,
   idbSet,
   isIdbAvailable,
 } from "../utils/cacheDb.js";
@@ -1561,13 +1562,14 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         ),
       );
       const unreadCount = Number(openedChat?.unread_count || 0);
-      const mobileFloor = isMobileViewport ? 10000 : CHAT_PAGE_CONFIG.messageFetchLimit;
+      // MOBILE FIX: Always respect messageFetchLimit, even on mobile.
+      // Loading 10,000 messages causes severe performance issues on mobile devices.
+      // Messages will be paginated as user scrolls - no need to load everything at once.
       const initialLimit = Math.min(
-        10000,
+        CHAT_PAGE_CONFIG.messageFetchLimit,
         Math.max(
           CHAT_PAGE_CONFIG.messageFetchLimit,
-          mobileFloor,
-          unreadCount > 0 ? unreadCount + 120 : 0,
+          unreadCount > 0 ? Math.min(unreadCount + 120, CHAT_PAGE_CONFIG.messageFetchLimit) : 0,
         ),
       );
       const canMarkReadNow = !isMobileViewport || mobileTab === "chat";
@@ -3540,7 +3542,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
         if (!firstUnreadMessage?.id && openingUnreadCountRef.current > 0 && !options.forceUnreadFetch) {
           const boostedLimit = Math.min(
-            10000,
+            CHAT_PAGE_CONFIG.messageFetchLimit,
             Math.max(
               CHAT_PAGE_CONFIG.messageFetchLimit,
               Number(openingUnreadCountRef.current || 0) + 200,
@@ -4798,15 +4800,25 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
   }, [getCacheStats, getCacheStatsFromIdb, settingsPanel, user?.username]);
 
-  const handleClearCache = useCallback(() => {
+  const handleClearCache = useCallback(async () => {
     if (typeof window === "undefined") return;
     if (!canUseLocalStorage()) {
       messagesCacheRef.current.clear();
-      setDataCacheStats(getCacheStats());
       if (canUseIdb()) {
-        void idbClearStore(CACHE_STORES.chatList);
-        void idbClearStore(CACHE_STORES.messages);
-        void idbClearStore(CACHE_STORES.index);
+        await Promise.all([
+          idbClearStore(CACHE_STORES.chatList),
+          idbClearStore(CACHE_STORES.messages),
+          idbClearStore(CACHE_STORES.index),
+        ]).catch(() => null);
+        // Refresh stats from IndexedDB after clearing
+        setTimeout(() => {
+          void (async () => {
+            const stats = await getCacheStatsFromIdb();
+            setDataCacheStats(stats);
+          })();
+        }, 100);
+      } else {
+        setDataCacheStats(getCacheStats());
       }
       return;
     }
@@ -4843,13 +4855,27 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
 
     messagesCacheRef.current.clear();
-    setDataCacheStats(getCacheStats());
+    
+    // Clear IndexedDB in parallel
     if (canUseIdb()) {
-      void idbClearStore(CACHE_STORES.chatList);
-      void idbClearStore(CACHE_STORES.messages);
-      void idbClearStore(CACHE_STORES.index);
+      await Promise.all([
+        idbClearStore(CACHE_STORES.chatList),
+        idbClearStore(CACHE_STORES.messages),
+        idbClearStore(CACHE_STORES.index),
+      ]).catch(() => null);
     }
-  }, [getCacheStats, user?.username]);
+
+    // Update stats to reflect cleared cache
+    setTimeout(() => {
+      setDataCacheStats(getCacheStats());
+      if (canUseIdb()) {
+        void (async () => {
+          const stats = await getCacheStatsFromIdb();
+          setDataCacheStats(stats);
+        })();
+      }
+    }, 100);
+  }, [getCacheStats, getCacheStatsFromIdb, user?.username]);
 
   const closeNewChatModal = () => {
     setNewChatOpen(false);

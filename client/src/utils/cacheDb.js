@@ -96,4 +96,55 @@ export const idbGetAllEntries = async (storeName) =>
     });
   });
 
+/**
+ * Get detailed statistics about IndexedDB storage usage
+ * Useful for cache size reporting and diagnostics
+ */
+export const idbGetStats = async () => {
+  if (!isIdbAvailable()) {
+    return {
+      available: false,
+      totalBytes: 0,
+      storeStats: {},
+    };
+  }
+
+  try {
+    const storeStats = {};
+    let totalBytes = 0;
+
+    for (const [storeName] of Object.entries(STORES)) {
+      const entries = await idbGetAllEntries(storeName);
+      let storeBytes = 0;
+      let count = 0;
+
+      entries.forEach((entry) => {
+        if (entry && typeof entry === "object") {
+          const entrySize = Number(entry.sizeBytes || 0);
+          storeBytes += entrySize;
+          count += 1;
+        }
+      });
+
+      totalBytes += storeBytes;
+      storeStats[storeName] = {
+        count,
+        bytes: storeBytes,
+      };
+    }
+
+    return {
+      available: true,
+      totalBytes,
+      storeStats,
+    };
+  } catch {
+    return {
+      available: false,
+      totalBytes: 0,
+      storeStats: {},
+    };
+  }
+};
+
 export const CACHE_STORES = STORES;
