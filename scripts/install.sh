@@ -625,7 +625,7 @@ clone_repo() {
     if [[ "$(prompt_yes_no "${INSTALL_DIR} exists and is not empty. Delete it and re-clone from GitHub?" "no")" != "yes" ]]; then
       warn "Installation canceled. Clear ${INSTALL_DIR} or use offline mode."
       press_enter_to_continue
-      return 0
+      return 1
     fi
     run_as_root rm -rf "$INSTALL_DIR"
     run_silent run_as_root mkdir -p "$INSTALL_DIR"
@@ -1459,7 +1459,7 @@ install_songbird() {
   if [[ "$SOURCE_MODE" == "offline" ]]; then
     ensure_offline_source_ready "install" || return 0
   else
-    clone_repo
+    clone_repo || return 1
   fi
   restore_backup_if_provided
   write_full_env_with_defaults
