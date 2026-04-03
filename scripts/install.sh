@@ -92,8 +92,10 @@ have_cmd() {
 }
 
 press_enter_to_continue() {
-  printf "\nPress Enter to return to the main menu..."
-  read -r _
+  printf "\nPress Enter to return to the main menu..." >&$PROMPT_FD_OUT
+  if ! IFS= read -r -u "$PROMPT_FD" _; then
+    _=""
+  fi
 }
 
 run_silent() {
@@ -1459,7 +1461,11 @@ install_songbird() {
   if [[ "$SOURCE_MODE" == "offline" ]]; then
     ensure_offline_source_ready "install" || return 0
   else
-    clone_repo || return 1
+    clone_repo || {
+      warn "Failed to clone repository. Installation canceled."
+      press_enter_to_continue
+      return 1
+    }
   fi
   restore_backup_if_provided
   write_full_env_with_defaults
