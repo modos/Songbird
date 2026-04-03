@@ -476,8 +476,24 @@ export function MessageFiles({
   if (!files.length) return null;
   const resolveFileRenderType = getFileRenderType || (() => "document");
 
+  const canPersistMediaCache = () => {
+    if (typeof window === "undefined") return false;
+    try {
+      if (window.matchMedia("(max-width: 767px) and (pointer: coarse)").matches) {
+        return false;
+      }
+      const testKey = "__songbird_media_cache__";
+      window.localStorage.setItem(testKey, "1");
+      window.localStorage.removeItem(testKey);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const writeMediaCache = (key, payload) => {
     if (typeof window === "undefined") return;
+    if (!canPersistMediaCache()) return;
     try {
       window.localStorage.setItem(key, JSON.stringify(payload));
     } catch (_) {

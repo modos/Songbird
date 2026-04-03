@@ -607,7 +607,7 @@ ensure_service_user_exists() {
 clone_repo() {
   run_silent run_as_root mkdir -p "$INSTALL_DIR"
 
-  if run_silent run_as_root test -d "$INSTALL_DIR/.git"; then
+  if run_as_root test -d "$INSTALL_DIR/.git"; then
     log "Repository exists at ${INSTALL_DIR}. Updating source..."
     run_in_install_dir "git fetch --all --prune"
     run_in_install_dir "git checkout main"
@@ -615,8 +615,12 @@ clone_repo() {
     return 0
   fi
 
-  if run_silent run_as_root test -n "$(run_silent run_as_root find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
-    fail "${INSTALL_DIR} is not empty and not a git checkout. Clear it or use another install path."
+  if run_as_root test -n "$(run_as_root_output find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
+    if [[ "$(prompt_yes_no "${INSTALL_DIR} exists and is not empty. Delete it and re-clone from GitHub?" "no")" != "yes" ]]; then
+      fail "Installation canceled. Clear ${INSTALL_DIR} or use offline mode."
+    fi
+    run_as_root rm -rf "$INSTALL_DIR"
+    run_silent run_as_root mkdir -p "$INSTALL_DIR"
   fi
 
   log "Cloning Songbird repository..."
