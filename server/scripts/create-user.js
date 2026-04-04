@@ -22,7 +22,7 @@ async function main() {
   const username = getFlagValue(args, '--username') || positional[1] || ''
   const password = getFlagValue(args, '--password') || positional[2] || ''
 
-  if (!username || !password) {
+  if (!nickname || !username || !password) {
     console.error('Usage: npm run db:user:create -- --nickname "Display Name" --username your_username --password your_password')
     console.error('Or positional: npm run db:user:create -- "Display Name" your_username your_password')
     process.exit(1)
@@ -40,7 +40,11 @@ async function main() {
     console.error(`Username must be at most ${USERNAME_MAX} characters.`)
     process.exit(1)
   }
-  if (nickname && nickname.length > (NICKNAME_MAX || 0)) {
+  if (nickname.length < 1) {
+    console.error('Nickname must not be empty.')
+    process.exit(1)
+  }
+  if (nickname.length > (NICKNAME_MAX || 0)) {
     console.error(`Nickname must be at most ${NICKNAME_MAX} characters.`)
     process.exit(1)
   }

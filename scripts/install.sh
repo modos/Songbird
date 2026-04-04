@@ -1221,6 +1221,23 @@ backup_database() {
   fi
 }
 
+preserve_backup_and_restore_data() {
+  log "Preserving data directory during update..."
+  # Since /data/ is in .gitignore, it will remain untouched during git operations
+  # However, we locate the backup zip for recovery purposes if needed
+  if [[ -d "$INSTALL_DIR/data/backups" ]]; then
+    local latest_backup="$(ls -t "$INSTALL_DIR/data/backups"/*.zip 2>/dev/null | head -1)"
+    if [[ -n "$latest_backup" ]]; then
+      # Copy backup to root directory for easy access and recovery
+      log "Preserving database backup: $(basename "$latest_backup")"
+      if run_as_root cp "$latest_backup" "/" 2>/dev/null; then
+        log "Backup copied to / for recovery purposes."
+      fi
+    fi
+  fi
+  log "Data directory (/data/) will remain untouched during git update."
+}
+
 run_migrations() {
   if [[ ! -d "$INSTALL_DIR/server" ]]; then
     warn "Server directory not found; skipping DB migrations."
@@ -1290,40 +1307,71 @@ update_songbird() {
     return 0
   fi
 
-  local before after
-  before=""
-  after=""
-
   if [[ -d "$INSTALL_DIR/.git" ]]; then
-    before="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
+    :
   else
     warn "No git checkout found at ${INSTALL_DIR}. Update requires GitHub mode."
     press_enter_to_continue
     return 0
   fi
 
-  run_in_install_dir "git fetch --all --prune"
-  run_in_install_dir "git checkout main"
-  run_in_install_dir "git pull --ff-only origin main"
-
-  after="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
-
-  if [[ "$before" == "$after" ]]; then
-    log "Songbird is already up to date. No rebuild needed."
+  # Fetch latest from remote
+  log "Checking for updates..."
+  if ! run_in_install_dir "git fetch --all --prune"; then
+    warn "Failed to fetch from remote. Check your network and credentials."
     press_enter_to_continue
+    return 1
   fi
 
-  log "New version detected. Installing dependencies..."
+  # Get local and remote commit hashes
+  local local_commit remote_commit
+  local_commit="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
+  remote_commit="$(run_in_install_dir "git rev-parse origin/main" | tr -d '\r\n')"
+
+  if [[ -z "$local_commit" || -z "$remote_commit" ]]; then
+    warn "Failed to determine current version. Check git repository status."
+    press_enter_to_continue
+    return 1
+  fi
+
+  # Check if update is available
+  if [[ "$local_commit" == "$remote_commit" ]]; then
+    log "Songbird is already up to date. No rebuild needed."
+    press_enter_to_continue
+    return 0
+  fi
+
+  # Update is available - proceed with safe update
+  log "Update available. Preparing to update Songbird..."
+  preserve_backup_and_restore_data
+
+  # Ensure we're on main branch and pull latest
+  if ! run_in_install_dir "git checkout main"; then
+    warn "Failed to checkout main branch."
+    press_enter_to_continue
+    return 1
+  fi
+
+  if ! run_in_install_dir "git pull --ff-only origin main"; then
+    warn "Failed to pull updates. Repository may have non-fast-forward changes."
+    press_enter_to_continue
+    return 1
+  fi
+
+  log "Installing dependencies..."
   install_songbird_dependencies
   ensure_vapid_keys
+  
+  log "Synchronizing database schema with latest version..."
   run_migrations
+
   apply_ownership
 
   log "Restarting Songbird service..."
   run_as_root systemctl restart songbird.service
   run_as_root systemctl reload nginx
 
-  log "Update completed."
+  log "Update completed successfully."
   press_enter_to_continue
 }
 
@@ -1429,24 +1477,6 @@ remove_songbird() {
   fi
 
   press_enter_to_continue
-}
-
-check_for_updates_notice() {
-  if [[ ! -d "$INSTALL_DIR/.git" ]]; then
-    return 0
-  fi
-
-  log "Checking for update..."
-
-  local local_head=""
-  local remote_head=""
-  run_in_install_dir "git fetch origin main --quiet" || return 0
-  local_head="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n' || true)"
-  remote_head="$(run_in_install_dir "git rev-parse origin/main" | tr -d '\r\n' || true)"
-
-  if [[ -n "$local_head" && -n "$remote_head" && "$local_head" != "$remote_head" ]]; then
-    warn "Update available. Choose '2) Update Songbird' from the menu."
-  fi
 }
 
 install_songbird() {
@@ -1886,7 +1916,6 @@ main() {
   detect_os
   ensure_sudo
   ensure_global_command_on_first_run
-  check_for_updates_notice
 
   trap 'handle_exit' EXIT
   trap 'handle_interrupt' INT TERM
