@@ -3583,6 +3583,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         openingHadUnreadRef.current = false;
         openingUnreadCountRef.current = 0;
         openingChatRef.current = false;
+        // Enable pagination after initial load completes (works on both desktop and mobile)
+        allowStartReachedRef.current = true;
       }
 
       if (options.forceBottom) {
@@ -5466,7 +5468,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }
 
   const handleStartReached = async () => {
-    if (isMobileViewport) return;
+    // FIXED: Pagination should work on mobile too!
+    // The scroll threshold detection in ChatWindowPanel works fine on mobile.
+    // This function just needed to actually execute on mobile instead of returning early.
     if (!activeChatId || loadingMessages || loadingOlderMessages || !hasOlderMessages) return;
     if (!allowStartReachedRef.current) return;
     const oldestMessage = messages[0];
