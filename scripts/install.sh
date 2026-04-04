@@ -1237,9 +1237,13 @@ preserve_backup_and_restore_data() {
     local latest_backup="$(ls -t "$INSTALL_DIR/data/backups"/*.zip 2>/dev/null | head -1)"
     if [[ -n "$latest_backup" ]]; then
       # Copy backup to root directory for easy access and recovery
-      log "Preserving database backup: $(basename "$latest_backup")"
-      if run_as_root cp "$latest_backup" "/" 2>/dev/null; then
-        log "Backup copied to / for recovery purposes."
+      local backup_filename="$(basename "$latest_backup")"
+      log "Found database backup: $latest_backup"
+      
+      if run_silent run_as_root cp "$latest_backup" "/$backup_filename"; then
+        log "✓ Backup copied to /$backup_filename for recovery purposes."
+      else
+        warn "Failed to copy backup to /. Backup remains in $INSTALL_DIR/data/backups/"
       fi
     fi
   fi
