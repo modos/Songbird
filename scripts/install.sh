@@ -143,6 +143,14 @@ run_in_install_dir() {
   run_silent run_as_root bash -lc "cd '$INSTALL_DIR' && $*"
 }
 
+run_in_install_dir_output() {
+  if [[ -n "$SUDO" ]]; then
+    $SUDO bash -lc "cd '$INSTALL_DIR' && $*"
+  else
+    bash -lc "cd '$INSTALL_DIR' && $*"
+  fi
+}
+
 init_prompt_io() {
   if [[ -r /dev/tty && -w /dev/tty ]]; then
     exec 3</dev/tty
@@ -1325,8 +1333,8 @@ update_songbird() {
 
   # Get local and remote commit hashes
   local local_commit remote_commit
-  local_commit="$(run_in_install_dir "git rev-parse HEAD" | tr -d '\r\n')"
-  remote_commit="$(run_in_install_dir "git rev-parse origin/main" | tr -d '\r\n')"
+  local_commit="$(run_in_install_dir_output "git rev-parse HEAD" | tr -d '\r\n')"
+  remote_commit="$(run_in_install_dir_output "git rev-parse origin/main" | tr -d '\r\n')"
 
   if [[ -z "$local_commit" || -z "$remote_commit" ]]; then
     warn "Failed to determine current version. Check git repository status."
