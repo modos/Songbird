@@ -3,7 +3,16 @@
 set -uo pipefail
 
 handle_exit() {
-  clear
+  local exit_code=$?
+  if [[ "$exit_code" -eq 0 ]]; then
+    clear
+    return 0
+  fi
+
+  printf "\n[SONGBIRD] Script exited with code %s.\n" "$exit_code" >&2
+  if [[ -f "$LOG_FILE" ]]; then
+    printf "[SONGBIRD] Review the log at %s for the last recorded step.\n" "$LOG_FILE" >&2
+  fi
 }
 
 handle_interrupt() {
@@ -21,6 +30,8 @@ REPO_URL="${REPO_URL:-https://github.com/bllackbull/Songbird.git}"
 SERVICE_USER="songbird"
 SERVICE_GROUP="songbird"
 SERVICE_FILE="/etc/systemd/system/songbird.service"
+LEGO_RENEW_SERVICE_FILE="/etc/systemd/system/songbird-lego-renew.service"
+LEGO_RENEW_TIMER_FILE="/etc/systemd/system/songbird-lego-renew.timer"
 NGINX_SITE_FILE="/etc/nginx/sites-available/songbird"
 NGINX_ENABLED_FILE="/etc/nginx/sites-enabled/songbird"
 DEFAULT_SERVER_PORT="5174"
@@ -28,10 +39,17 @@ DEFAULT_CLIENT_PORT="80"
 DEFAULT_FILE_UPLOAD="true"
 DEFAULT_MAX_UPLOAD="78643200"
 DEFAULT_RETENTION_DAYS="7"
+DEFAULT_TEXT_RETENTION_DAYS="0"
 DEFAULT_ACCOUNT_CREATION="true"
+DEFAULT_CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES="5242880"
+DEFAULT_CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS="480"
 NODE_MAJOR="24"
 SCRIPT_REMOTE_URL="${SCRIPT_REMOTE_URL:-https://raw.githubusercontent.com/bllackbull/Songbird/main/scripts/install.sh}"
 LOG_LINES="${LOG_LINES:-100}"
+CERT_INSTALL_DIR="/etc/ssl/songbird"
+ACME_WEBROOT="/var/lib/songbird/certbot"
+LEGO_STATE_DIR="/var/lib/songbird/lego"
+LEGO_BIN="/usr/local/bin/lego"
 
 # Mirror URLs
 MIRROR_NODESOURCE="${MIRROR_NODESOURCE:-}"
@@ -49,14 +67,26 @@ CLIENT_PORT="$DEFAULT_CLIENT_PORT"
 FILE_UPLOAD="$DEFAULT_FILE_UPLOAD"
 MAX_UPLOAD="$DEFAULT_MAX_UPLOAD"
 RETENTION_DAYS="$DEFAULT_RETENTION_DAYS"
+TEXT_RETENTION_DAYS="$DEFAULT_TEXT_RETENTION_DAYS"
 ACCOUNT_CREATION="$DEFAULT_ACCOUNT_CREATION"
 NGINX_SERVER_NAME="_"
 CURRENT_ENV_FILE=""
 PROMPT_FD=0
 PROMPT_FD_OUT=1
 DB_BACKUP_PATH=""
+DB_BACKUP_PASSWORD=""
+RESTORE_BACKUP_QUIET="no"
+LAST_UNZIP_OUTPUT=""
+LAST_UNZIP_STATUS=0
+EXTRACT_SOURCE_DIR=""
+EXTRACT_ENV_SRC=""
 SOURCE_MODE=""
 SOURCE_ZIP_PATH=""
+CERT_MODE="http"
+CERTBOT_IP_ADDRESS=""
+MANUAL_CERT_FULLCHAIN_PATH=""
+MANUAL_CERT_PRIVKEY_PATH=""
+NODE_EXEC_PATH=""
 
 log() {
   local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -79,11 +109,19 @@ ensure_log_dir() {
 }
 
 warn() {
+  local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
   printf "[%s] WARNING: %s\n" "SONGBIRD" "$*" >&2
+  if [[ -f "$LOG_FILE" ]]; then
+    printf "[%s] [SONGBIRD] WARNING: %s\n" "$timestamp" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  fi
 }
 
 fail() {
+  local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
   printf "[%s] ERROR: %s\n" "SONGBIRD" "$*" >&2
+  if [[ -f "$LOG_FILE" ]]; then
+    printf "[%s] [SONGBIRD] ERROR: %s\n" "$timestamp" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  fi
   exit 1
 }
 
@@ -122,6 +160,43 @@ run_silent() {
   fi
 }
 
+run_logged_quiet() {
+  local output
+  if [[ -f "$LOG_FILE" ]]; then
+    printf "[%s] Running: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+
+  if ! output="$("$@" 2>&1)"; then
+    if [[ -f "$LOG_FILE" ]]; then
+      printf "[%s] FAILED: %s\n%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$output" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+    return 1
+  fi
+
+  if [[ -f "$LOG_FILE" ]]; then
+    printf "[%s] SUCCESS: %s\n%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$output" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
+run_unzip_capture() {
+  local output=""
+  local status=0
+  if output="$(run_as_root "$@" </dev/null 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  LAST_UNZIP_OUTPUT="$output"
+  LAST_UNZIP_STATUS="$status"
+  [[ "$status" -eq 0 ]]
+}
+
+output_looks_password_related() {
+  local text=""
+  text="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ "$text" == *password* || "$text" == *encrypted* || "$text" == *"unable to get password"* || "$text" == *"incorrect password"* || "$text" == *"skipping:"* ]]
+}
+
 
 run_as_root() {
   if [[ -n "$SUDO" ]]; then
@@ -149,6 +224,13 @@ run_in_install_dir_output() {
   else
     bash -lc "cd '$INSTALL_DIR' && $*"
   fi
+}
+
+dir_has_entries() {
+  local target_dir="$1"
+  local first_entry=""
+  first_entry="$(run_as_root_output find "$target_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+  [[ -n "$first_entry" ]]
 }
 
 init_prompt_io() {
@@ -212,6 +294,19 @@ prompt_secret() {
   done
 }
 
+prompt_secret_optional() {
+  local prompt="$1"
+  local value=""
+  printf "%s: " "$prompt" >&$PROMPT_FD_OUT
+  if ! IFS= read -ers -u "$PROMPT_FD" value; then
+    value=""
+  fi
+  printf "\n" >&$PROMPT_FD_OUT
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf "%s" "$value"
+}
+
 prompt_yes_no() {
   local prompt="$1"
   local default="$2"
@@ -247,11 +342,12 @@ prompt_port() {
 }
 
 prompt_client_port() {
+  local default_port="${1:-$DEFAULT_CLIENT_PORT}"
   local value=""
   while true; do
-    prompt_read "Enter client (nginx) port (default: $DEFAULT_CLIENT_PORT): " value
+    prompt_read "Enter client (nginx) port (default: $default_port): " value
     if [[ -z "$value" ]]; then
-      printf "%s" "$DEFAULT_CLIENT_PORT"
+      printf "%s" "$default_port"
       return 0
     fi
     if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 )); then
@@ -268,6 +364,21 @@ prompt_retention_days() {
     prompt_read "Enter files auto deletion interval in days (0 disables, default: $DEFAULT_RETENTION_DAYS): " value
     if [[ -z "$value" ]]; then
       value="$DEFAULT_RETENTION_DAYS"
+    fi
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+      printf "%s" "$value"
+      return 0
+    fi
+    printf "Please enter a non-negative integer.\n"
+  done
+}
+
+prompt_text_retention_days() {
+  local value=""
+  while true; do
+    prompt_read "Enter text-only message auto deletion interval in days (0 disables, default: $DEFAULT_TEXT_RETENTION_DAYS): " value
+    if [[ -z "$value" ]]; then
+      value="$DEFAULT_TEXT_RETENTION_DAYS"
     fi
     if [[ "$value" =~ ^[0-9]+$ ]]; then
       printf "%s" "$value"
@@ -406,10 +517,9 @@ prompt_source_mode() {
     printf "\nSource Mode\n"
     printf "1) GitHub\n"
     printf "2) Offline\n"
-    prompt_read "Choose an option [1-2] (default: 1): " mode
+    prompt_read "Choose an option [1-2]: " mode
     mode="${mode#"${mode%%[![:space:]]*}"}"
     mode="${mode%"${mode##*[![:space:]]}"}"
-    [[ -z "$mode" ]] && mode="1"
     case "$mode" in
       1)
         SOURCE_MODE="github"
@@ -424,6 +534,113 @@ prompt_source_mode() {
   done
 }
 
+prompt_deploy_mode() {
+  local mode=""
+  while true; do
+    printf "\nDeploy Mode\n"
+    printf "1) Domain\n"
+    printf "2) IP\n"
+    prompt_read "Choose an option [1-2]: " mode
+    mode="${mode#"${mode%%[![:space:]]*}"}"
+    mode="${mode%"${mode##*[![:space:]]}"}"
+    case "$mode" in
+      1)
+        DEPLOY_MODE="domain"
+        break
+        ;;
+      2)
+        DEPLOY_MODE="ip"
+        break
+        ;;
+      *) printf "Choose 1 or 2.\n" ;;
+    esac
+  done
+}
+
+prompt_cert_mode() {
+  local mode=""
+  while true; do
+    local option_one_label="Obtain certificate"
+    if [[ "$DEPLOY_MODE" == "domain" ]]; then
+      option_one_label="Obtain cert for domain"
+    else
+      option_one_label="Obtain 6-day cert for IP"
+    fi
+    printf "\nCertificate Mode\n"
+    printf "1) %s\n" "$option_one_label"
+    printf "2) TLS certificate files\n"
+    printf "3) HTTP only\n"
+    prompt_read "Choose an option [1-3]: " mode
+    mode="${mode#"${mode%%[![:space:]]*}"}"
+    mode="${mode%"${mode##*[![:space:]]}"}"
+    case "$mode" in
+      1)
+        CERT_MODE="certbot"
+        break
+        ;;
+      2)
+        CERT_MODE="files"
+        break
+        ;;
+      3)
+        CERT_MODE="http"
+        break
+        ;;
+      *) printf "Choose 1, 2, or 3.\n" ;;
+    esac
+  done
+}
+
+prompt_backup_zip_path() {
+  local backup_input=""
+  while true; do
+    prompt_read "Enter the full path to the backup .zip file: " backup_input
+    if [[ -z "$backup_input" ]]; then
+      printf "Please provide a file path.\n"
+      continue
+    fi
+    local resolved=""
+    resolved="$(resolve_file_path "$backup_input")" || resolved=""
+    if [[ -z "$resolved" ]]; then
+      printf "File not found. Tried: %s\n" "$backup_input"
+      continue
+    fi
+    if [[ "${resolved,,}" != *.zip ]]; then
+      printf "Backup file must be a .zip archive.\n"
+      continue
+    fi
+    printf "%s" "$resolved"
+    return 0
+  done
+}
+
+select_backup_zip_path() {
+  local use_detected=""
+  local detected=""
+  detected="$(find_restore_backup_zip)" || detected=""
+  if [[ -n "$detected" ]]; then
+    use_detected="$(prompt_yes_no "Use detected backup zip ${detected}?" "yes")"
+    if [[ "$use_detected" == "yes" ]]; then
+      printf "%s" "$detected"
+      return 0
+    fi
+  fi
+
+  prompt_backup_zip_path
+}
+
+prompt_install_backup_restore() {
+  DB_BACKUP_PATH=""
+  DB_BACKUP_PASSWORD=""
+  if [[ "$(prompt_yes_no "Restore database from a backup zip during installation?" "no")" != "yes" ]]; then
+    return 0
+  fi
+
+  DB_BACKUP_PATH="$(select_backup_zip_path)"
+  DB_BACKUP_PASSWORD="$(prompt_secret_optional "Backup password (leave blank if not encrypted)")"
+  return 0
+}
+
 validate_backup_zip() {
   local zip_path="$1"
   local listing
@@ -432,11 +649,11 @@ validate_backup_zip() {
     printf "Backup zip appears empty or unreadable.\n"
     return 1
   fi
-  if ! echo "$listing" | grep -qE '(^|/)(songbird\.db)$'; then
+  if ! echo "$listing" | grep -qE '(^|/)data/songbird\.db$|(^|/)(songbird\.db)$'; then
     printf "Backup zip missing songbird.db.\n"
     return 1
   fi
-  if ! echo "$listing" | grep -qE '(^|/)uploads(/|$)'; then
+  if ! echo "$listing" | grep -qE '(^|/)data/uploads(/|$)|(^|/)uploads(/|$)'; then
     printf "Backup zip missing uploads/ directory.\n"
     return 1
   fi
@@ -473,10 +690,18 @@ prepare_source_root_for_data_copy() {
 extract_backup_zip() {
   local zip_path="$1"
   local tmp_dir="$2"
+  local password="${3:-}"
+  EXTRACT_SOURCE_DIR=""
+  EXTRACT_ENV_SRC=""
 
-  run_silent run_as_root unzip -q "$zip_path" -d "$tmp_dir"
+  if [[ -n "$password" ]]; then
+    run_unzip_capture unzip -P "$password" -q "$zip_path" -d "$tmp_dir" || return 1
+  else
+    run_unzip_capture unzip -q "$zip_path" -d "$tmp_dir" || return 1
+  fi
 
   local source_dir="$tmp_dir"
+  local env_src="$tmp_dir/.env"
   if [[ -d "$tmp_dir/data" ]]; then
     source_dir="$tmp_dir/data"
   fi
@@ -488,7 +713,13 @@ extract_backup_zip() {
     return 1
   fi
 
-  printf "%s" "$source_dir"
+  if [[ ! -f "$env_src" && -f "$source_dir/.env" ]]; then
+    env_src="$source_dir/.env"
+  fi
+
+  EXTRACT_SOURCE_DIR="$source_dir"
+  EXTRACT_ENV_SRC="$env_src"
+  return 0
 }
 
 detect_os() {
@@ -521,12 +752,14 @@ install_required_packages() {
     lsb-release
     build-essential
     nginx
-    python3-certbot-nginx
     ffmpeg
     nano
     zip
     unzip
   )
+  if [[ "$CERT_MODE" == "certbot" && "$DEPLOY_MODE" == "domain" ]]; then
+    required_pkgs+=(python3-certbot-nginx)
+  fi
   local missing_pkgs=()
   local pkg=""
 
@@ -612,12 +845,85 @@ ensure_nodejs_from_nodesource() {
   run_silent run_as_root apt-get install -y nodejs
 }
 
+resolve_node_exec_path() {
+  local node_path=""
+  if have_cmd node; then
+    node_path="$(command -v node)"
+  elif have_cmd nodejs; then
+    node_path="$(command -v nodejs)"
+  fi
+
+  if [[ -z "$node_path" ]]; then
+    fail "Node.js executable not found in PATH after installation."
+  fi
+
+  NODE_EXEC_PATH="$node_path"
+  log "Using Node.js executable for systemd service: ${NODE_EXEC_PATH}"
+}
+
 
 ensure_service_user_exists() {
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     log "Creating dedicated system user: ${SERVICE_USER}"
     run_silent run_as_root useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
+}
+
+map_lego_arch() {
+  local machine=""
+  machine="$(uname -m)"
+  case "$machine" in
+    x86_64|amd64) printf "amd64" ;;
+    aarch64|arm64) printf "arm64" ;;
+    armv7l|armv7) printf "armv7" ;;
+    armv6l|armv6) printf "armv6" ;;
+    i386|i686) printf "386" ;;
+    *) fail "Unsupported architecture for lego binary install: ${machine}" ;;
+  esac
+}
+
+lego_supports_shortlived_profile() {
+  [[ -x "$LEGO_BIN" ]] || return 1
+  local help_text=""
+  help_text="$("$LEGO_BIN" run --help 2>&1 || true)"
+  [[ "$help_text" == *"--profile"* ]]
+}
+
+ensure_lego_installed() {
+  if [[ -x "$LEGO_BIN" ]]; then
+    if lego_supports_shortlived_profile; then
+      log "lego binary already installed at ${LEGO_BIN}."
+      return 0
+    fi
+    warn "Existing lego binary at ${LEGO_BIN} does not support --profile; upgrading."
+  fi
+
+  local latest_url=""
+  latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/go-acme/lego/releases/latest)" || {
+    fail "Unable to resolve latest lego release URL."
+  }
+  local latest_tag="${latest_url##*/}"
+  [[ -n "$latest_tag" ]] || fail "Unable to determine latest lego release tag."
+
+  local arch=""
+  arch="$(map_lego_arch)"
+  local asset="lego_${latest_tag}_linux_${arch}.tar.gz"
+  local download_url="https://github.com/go-acme/lego/releases/download/${latest_tag}/${asset}"
+  local tmp_dir=""
+  tmp_dir="$(mktemp -d)"
+
+  log "Downloading lego ${latest_tag} for linux/${arch}..."
+  curl -fsSL "$download_url" -o "${tmp_dir}/${asset}" || {
+    run_silent run_as_root rm -rf "$tmp_dir"
+    fail "Unable to download lego binary from ${download_url}"
+  }
+
+  run_silent run_as_root tar -xzf "${tmp_dir}/${asset}" -C "$tmp_dir"
+  run_silent run_as_root install -m 755 "${tmp_dir}/lego" "$LEGO_BIN"
+  run_silent run_as_root rm -rf "$tmp_dir"
+  log "Installed lego at ${LEGO_BIN}."
+
+  lego_supports_shortlived_profile || fail "Installed lego at ${LEGO_BIN} does not support --profile. Please verify the binary and try again."
 }
 
 clone_repo() {
@@ -631,7 +937,7 @@ clone_repo() {
     return 0
   fi
 
-  if run_as_root test -n "$(run_as_root_output find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
+  if dir_has_entries "$INSTALL_DIR"; then
     if [[ "$(prompt_yes_no "${INSTALL_DIR} exists and is not empty. Delete it and re-clone from GitHub?" "no")" != "yes" ]]; then
       warn "Installation canceled. Clear ${INSTALL_DIR} or use offline mode."
       return 1
@@ -646,11 +952,46 @@ clone_repo() {
 
 prepare_install_dir_for_offline() {
   run_silent run_as_root mkdir -p "$INSTALL_DIR"
-  if run_silent run_as_root test -n "$(run_silent run_as_root find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
-    warn "${INSTALL_DIR} is not empty. Clear it or use another install path for offline mode."
+  if dir_has_entries "$INSTALL_DIR"; then
+    warn "${INSTALL_DIR} is not empty. Clear it before installation."
     press_enter_to_continue
-    return 0
+    return 1
   fi
+  return 0
+}
+
+find_offline_source_zip() {
+  local zip_name="songbird.zip"
+  local candidates=(
+    "$HOME/${zip_name}"
+    "/root/${zip_name}"
+    "/${zip_name}"
+  )
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    if file_exists_path "$candidate"; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_restore_backup_zip() {
+  local candidates=(
+    "/opt/songbird/data/backups"
+    "/root"
+  )
+  local dir=""
+  for dir in "${candidates[@]}"; do
+    local found=""
+    found="$(run_as_root_output bash -lc "find '$dir' -maxdepth 1 -type f -name 'songbird-backup-*.zip' -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -1 | cut -f2-" | tr -d '\r\n')" || found=""
+    if [[ -n "$found" && -f "$found" ]]; then
+      printf "%s" "$found"
+      return 0
+    fi
+  done
+  return 1
 }
 
 resolve_offline_source_root() {
@@ -672,29 +1013,23 @@ resolve_offline_source_root() {
   return 1
 }
 
-has_source_at_install_dir() {
-  if [[ ! -d "$INSTALL_DIR" ]]; then
-    return 1
-  fi
-  [[ -f "$INSTALL_DIR/package.json" && -d "$INSTALL_DIR/server" && -d "$INSTALL_DIR/client" ]]
-}
-
 ensure_offline_source_ready() {
   local mode_label="$1"
-  if ! has_source_at_install_dir; then
-    log "Offline ${mode_label} requires the source code at ${INSTALL_DIR}."
-    log "Copy or extract Songbird into ${INSTALL_DIR} and try again."
+  local zip_path=""
+  zip_path="$(find_offline_source_zip)" || zip_path=""
+  if [[ -z "$zip_path" ]]; then
+    warn "Offline ${mode_label} requires /songbird.zip to be available at the filesystem root."
     press_enter_to_continue
     return 1
   fi
+  SOURCE_ZIP_PATH="$zip_path"
   return 0
 }
 
-install_source_from_zip() {
+extract_offline_source_zip() {
   local zip_path="$1"
-  have_cmd unzip || fail "unzip is required for offline installs. Install it first and retry."
-
-  prepare_install_dir_for_offline
+  local mode_label="$2"
+  have_cmd unzip || fail "unzip is required for offline ${mode_label}s. Install it first and retry."
 
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -705,6 +1040,59 @@ install_source_from_zip() {
     run_silent run_as_root rm -rf "$tmp_dir"
     fail "Source zip does not appear to contain Songbird (missing server/client/package.json)."
   }
+
+  printf "%s|%s" "$tmp_dir" "$source_root"
+}
+
+read_version_value() {
+  local version_file="$1"
+  if [[ ! -f "$version_file" ]]; then
+    return 1
+  fi
+  local version=""
+  version="$(head -n 1 "$version_file" | tr -d '\r\n' | xargs)"
+  if [[ -z "$version" ]]; then
+    return 1
+  fi
+  printf "%s" "$version"
+}
+
+offline_source_is_newer() {
+  local source_root="$1"
+  local install_root="$2"
+
+  local source_version_file="$source_root/VERSION"
+  local install_version_file="$install_root/VERSION"
+  local source_version=""
+  local install_version=""
+
+  source_version="$(read_version_value "$source_version_file")" || {
+    warn "Offline source is missing VERSION. Skipping update."
+    return 1
+  }
+
+  install_version="$(read_version_value "$install_version_file")" || install_version=""
+  if [[ -z "$install_version" ]]; then
+    log "Installed app is missing VERSION. Treating offline source ${source_version} as newer."
+    return 0
+  fi
+
+  if dpkg --compare-versions "$source_version" gt "$install_version"; then
+    log "Offline source version ${source_version} is newer than installed version ${install_version}."
+    return 0
+  fi
+
+  log "Offline source version ${source_version} is not newer than installed version ${install_version}."
+  return 1
+}
+
+install_source_from_zip() {
+  local zip_path="$1"
+  prepare_install_dir_for_offline || return 1
+  local extract_result=""
+  extract_result="$(extract_offline_source_zip "$zip_path" "install")"
+  local tmp_dir="${extract_result%%|*}"
+  local source_root="${extract_result#*|}"
 
   prepare_source_root_for_data_copy "$zip_path" "$source_root" "install"
 
@@ -714,21 +1102,15 @@ install_source_from_zip() {
   fi
   apply_ownership
   run_silent run_as_root rm -rf "$tmp_dir"
+  return 0
 }
 
 update_source_from_zip() {
   local zip_path="$1"
-  have_cmd unzip || fail "unzip is required for offline updates. Install it first and retry."
-
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  run_silent run_as_root unzip -q "$zip_path" -d "$tmp_dir"
-
-  local source_root
-  source_root="$(resolve_offline_source_root "$tmp_dir")" || {
-    run_silent run_as_root rm -rf "$tmp_dir"
-    fail "Source zip does not appear to contain Songbird (missing server/client/package.json)."
-  }
+  local extract_result=""
+  extract_result="$(extract_offline_source_zip "$zip_path" "update")"
+  local tmp_dir="${extract_result%%|*}"
+  local source_root="${extract_result#*|}"
 
   prepare_source_root_for_data_copy "$zip_path" "$source_root" "update"
 
@@ -828,11 +1210,17 @@ write_env_from_example() {
   local existing_subject
   local existing_server_port
   local existing_client_port
+  local existing_voice_waveform_max_decode_bytes
+  local existing_voice_waveform_max_decode_seconds
+  local existing_storage_encryption_key
   existing_public_key="$(get_existing_env_value "VAPID_PUBLIC_KEY" "")"
   existing_private_key="$(get_existing_env_value "VAPID_PRIVATE_KEY" "")"
   existing_subject="$(get_existing_env_value "VAPID_SUBJECT" "mailto:admin@example.com")"
   existing_server_port="$(get_existing_env_value_with_fallback "SERVER_PORT" "PORT" "$DEFAULT_SERVER_PORT")"
   existing_client_port="$(get_existing_env_value "CLIENT_PORT" "$DEFAULT_CLIENT_PORT")"
+  existing_voice_waveform_max_decode_bytes="$(get_existing_env_value "CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES" "$DEFAULT_CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES")"
+  existing_voice_waveform_max_decode_seconds="$(get_existing_env_value "CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS" "$DEFAULT_CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS")"
+  existing_storage_encryption_key="$(get_existing_env_value "STORAGE_ENCRYPTION_KEY" "")"
 
   run_silent run_as_root cp "$example_file" "$env_file"
   replace_env_value "$env_file" "SERVER_PORT" "$existing_server_port"
@@ -843,6 +1231,10 @@ write_env_from_example() {
   replace_env_value "$env_file" "FILE_UPLOAD" "$FILE_UPLOAD"
   replace_env_value "$env_file" "FILE_UPLOAD_MAX_TOTAL_SIZE" "$MAX_UPLOAD"
   replace_env_value "$env_file" "MESSAGE_FILE_RETENTION" "$RETENTION_DAYS"
+  replace_env_value "$env_file" "MESSAGE_TEXT_RETENTION" "$TEXT_RETENTION_DAYS"
+  replace_env_value "$env_file" "CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES" "$existing_voice_waveform_max_decode_bytes"
+  replace_env_value "$env_file" "CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS" "$existing_voice_waveform_max_decode_seconds"
+  replace_env_value "$env_file" "STORAGE_ENCRYPTION_KEY" "$existing_storage_encryption_key"
   replace_env_value "$env_file" "VAPID_PUBLIC_KEY" "$existing_public_key"
   replace_env_value "$env_file" "VAPID_PRIVATE_KEY" "$existing_private_key"
   if [[ -n "$CERTBOT_EMAIL" ]]; then
@@ -856,9 +1248,11 @@ write_env_from_example() {
 
 write_env_fallback() {
   local env_file="$1"
+  local existing_storage_encryption_key
   local existing_public_key
   local existing_private_key
   local existing_subject
+  existing_storage_encryption_key="$(get_existing_env_value "STORAGE_ENCRYPTION_KEY" "")"
   existing_public_key="$(get_existing_env_value "VAPID_PUBLIC_KEY" "")"
   existing_private_key="$(get_existing_env_value "VAPID_PRIVATE_KEY" "")"
   existing_subject="$(get_existing_env_value "VAPID_SUBJECT" "mailto:admin@example.com")"
@@ -874,6 +1268,7 @@ FILE_UPLOAD_MAX_TOTAL_SIZE=${MAX_UPLOAD}
 FILE_UPLOAD_MAX_FILES=10
 FILE_UPLOAD_TRANSCODE_VIDEOS=true
 MESSAGE_FILE_RETENTION=${RETENTION_DAYS}
+MESSAGE_TEXT_RETENTION=${TEXT_RETENTION_DAYS}
 MESSAGE_MAX_CHARS=4000
 CHAT_PENDING_TEXT_TIMEOUT=300000
 CHAT_PENDING_FILE_TIMEOUT=1200000
@@ -888,8 +1283,11 @@ CHAT_PEER_PRESENCE_POLL_INTERVAL=3000
 CHAT_HEALTH_CHECK_INTERVAL=10000
 CHAT_SSE_RECONNECT_DELAY=2000
 CHAT_SEARCH_MAX_RESULTS=5
+CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES=${DEFAULT_CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES}
+CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS=${DEFAULT_CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS}
 NICKNAME_MAX=24
 USERNAME_MAX=16
+STORAGE_ENCRYPTION_KEY=${existing_storage_encryption_key}
 VAPID_PUBLIC_KEY=${existing_public_key}
 VAPID_PRIVATE_KEY=${existing_private_key}
 VAPID_SUBJECT=${existing_subject}
@@ -952,6 +1350,7 @@ sync_values_from_env() {
   FILE_UPLOAD="$(get_existing_env_value "FILE_UPLOAD" "$DEFAULT_FILE_UPLOAD")"
   MAX_UPLOAD="$(get_existing_env_value "FILE_UPLOAD_MAX_TOTAL_SIZE" "$DEFAULT_MAX_UPLOAD")"
   RETENTION_DAYS="$(get_existing_env_value "MESSAGE_FILE_RETENTION" "$DEFAULT_RETENTION_DAYS")"
+  TEXT_RETENTION_DAYS="$(get_existing_env_value "MESSAGE_TEXT_RETENTION" "$DEFAULT_TEXT_RETENTION_DAYS")"
   ACCOUNT_CREATION="$(get_existing_env_value "ACCOUNT_CREATION" "$DEFAULT_ACCOUNT_CREATION")"
   CURRENT_ENV_FILE="$env_file"
 }
@@ -974,21 +1373,7 @@ parse_domain_input() {
 
 
 collect_install_options() {
-  local mode=""
-  while true; do
-    prompt_read "Deploy behind a domain or server IP? [domain/ip] (default: domain): " mode
-    mode="$(printf "%s" "$mode" | tr '[:upper:]' '[:lower:]')"
-    [[ -z "$mode" ]] && mode="domain"
-    case "$mode" in
-      domain|ip)
-        DEPLOY_MODE="$mode"
-        break
-        ;;
-      *)
-        printf "Choose either 'domain' or 'ip'.\n"
-        ;;
-    esac
-  done
+  prompt_deploy_mode
 
   if [[ "$DEPLOY_MODE" == "domain" ]]; then
     local raw_domains=""
@@ -1004,17 +1389,49 @@ collect_install_options() {
       fi
       printf "Please enter at least one domain.\n"
     done
-    CERTBOT_EMAIL="$(prompt_non_empty "Enter email for Let's Encrypt renewal notices")"
   else
     NGINX_SERVER_NAME="_"
   fi
 
+  prompt_cert_mode
+
+  case "$CERT_MODE" in
+    certbot)
+      CERTBOT_EMAIL="$(prompt_non_empty "Enter email for Let's Encrypt renewal notices")"
+      if [[ "$DEPLOY_MODE" == "ip" ]]; then
+        CERTBOT_IP_ADDRESS="$(prompt_non_empty "Enter the public IP address for the TLS certificate")"
+        NGINX_SERVER_NAME="$CERTBOT_IP_ADDRESS"
+      fi
+      ;;
+    files)
+      while true; do
+        MANUAL_CERT_FULLCHAIN_PATH="$(prompt_non_empty "Enter path to fullchain.pem")"
+        MANUAL_CERT_FULLCHAIN_PATH="$(resolve_file_path "$MANUAL_CERT_FULLCHAIN_PATH")" || MANUAL_CERT_FULLCHAIN_PATH=""
+        if [[ -n "$MANUAL_CERT_FULLCHAIN_PATH" ]]; then
+          break
+        fi
+        printf "Could not find that fullchain.pem file.\n"
+      done
+      while true; do
+        MANUAL_CERT_PRIVKEY_PATH="$(prompt_non_empty "Enter path to privkey.pem")"
+        MANUAL_CERT_PRIVKEY_PATH="$(resolve_file_path "$MANUAL_CERT_PRIVKEY_PATH")" || MANUAL_CERT_PRIVKEY_PATH=""
+        if [[ -n "$MANUAL_CERT_PRIVKEY_PATH" ]]; then
+          break
+        fi
+        printf "Could not find that privkey.pem file.\n"
+      done
+      ;;
+  esac
+
 
   SERVER_PORT="$(prompt_port)"
-  if [[ "$DEPLOY_MODE" == "ip" ]]; then
-    CLIENT_PORT="$(prompt_client_port)"
+  if [[ "$CERT_MODE" == "http" ]]; then
+    CLIENT_PORT="$(prompt_client_port "$DEFAULT_CLIENT_PORT")"
   else
-    CLIENT_PORT="$DEFAULT_CLIENT_PORT"
+    CLIENT_PORT="$(prompt_client_port "443")"
+  fi
+  if [[ "$CERT_MODE" != "http" ]]; then
+    log "Using HTTP redirect on port 80 and HTTPS on port ${CLIENT_PORT}."
   fi
 
   if [[ "$(prompt_yes_no "Allow account creation via website?" "yes")" == "yes" ]]; then
@@ -1034,6 +1451,7 @@ collect_install_options() {
   else
     RETENTION_DAYS="0"
   fi
+  TEXT_RETENTION_DAYS="$(prompt_text_retention_days)"
 
 }
 
@@ -1050,6 +1468,7 @@ apply_ownership() {
 
 configure_systemd_service() {
   log "Creating systemd service at ${SERVICE_FILE}..."
+  [[ -n "$NODE_EXEC_PATH" ]] || resolve_node_exec_path
   run_silent run_as_root tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
 Description=Songbird server
@@ -1060,8 +1479,9 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${INSTALL_DIR}/server
-ExecStart=/usr/bin/env node index.js
+ExecStart=${NODE_EXEC_PATH} ${INSTALL_DIR}/server/index.js
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -1072,15 +1492,89 @@ EOF
   run_as_root systemctl restart songbird.service
 }
 
-configure_nginx() {
+write_nginx_site_config() {
+  local mode="${1:-http}"
+  local cert_path="${2:-}"
+  local key_path="${3:-}"
   local server_name_line="server_name ${NGINX_SERVER_NAME};"
+  local listen_line="listen ${CLIENT_PORT} default_server;"
+  local ssl_block=""
+  local acme_block=""
+  local redirect_server_block=""
+
+  if [[ "$mode" == "http" && "$DEPLOY_MODE" == "domain" && "$CERT_MODE" == "certbot" ]]; then
+    listen_line="listen 80 default_server;"
+  fi
+
+  if [[ "$mode" == "ssl" ]]; then
+    listen_line="listen ${CLIENT_PORT} ssl default_server;"
+    ssl_block=$(cat <<EOF
+  ssl_certificate ${cert_path};
+  ssl_certificate_key ${key_path};
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 1d;
+EOF
+)
+
+    if [[ "$DEPLOY_MODE" == "ip" && "$CERT_MODE" == "certbot" ]]; then
+      redirect_server_block=$(cat <<EOF
+
+server {
+  listen 80;
+  ${server_name_line}
+  location /.well-known/acme-challenge/ {
+    root ${ACME_WEBROOT};
+    default_type "text/plain";
+  }
+  if (\$request_uri !~ "^/\\.well-known/acme-challenge/") {
+    return 301 https://\$host$( [[ "$CLIENT_PORT" == "443" ]] && printf "" || printf ":%s" "$CLIENT_PORT" )\$request_uri;
+  }
+}
+EOF
+)
+    elif [[ "$CLIENT_PORT" == "443" ]]; then
+      redirect_server_block=$(cat <<EOF
+
+server {
+  listen 80;
+  ${server_name_line}
+  return 301 https://\$host\$request_uri;
+}
+EOF
+)
+    elif [[ "$CLIENT_PORT" != "80" ]]; then
+      redirect_server_block=$(cat <<EOF
+
+server {
+  listen 80;
+  ${server_name_line}
+  return 301 https://\$host:${CLIENT_PORT}\$request_uri;
+}
+EOF
+)
+    fi
+  fi
+
+  if [[ "$mode" == "http" && "$DEPLOY_MODE" == "ip" && "$CERT_MODE" == "certbot" ]]; then
+    run_silent run_as_root mkdir -p "$ACME_WEBROOT"
+    acme_block=$(cat <<EOF
+
+  location /.well-known/acme-challenge/ {
+    root ${ACME_WEBROOT};
+    default_type "text/plain";
+  }
+EOF
+)
+  fi
 
   log "Creating Nginx config at ${NGINX_SITE_FILE}..."
   run_silent run_as_root tee "$NGINX_SITE_FILE" >/dev/null <<EOF
 server {
-  listen ${CLIENT_PORT} default_server;
+  ${listen_line}
   ${server_name_line}
   client_max_body_size ${MAX_UPLOAD};
+${ssl_block}
+${acme_block}
 
   location /api/events {
     proxy_pass http://127.0.0.1:${SERVER_PORT};
@@ -1108,20 +1602,157 @@ server {
     proxy_cache_bypass \$http_upgrade;
   }
 }
+${redirect_server_block}
 EOF
+}
+
+configure_nginx() {
+  log "Preparing initial HTTP nginx configuration..."
+  write_nginx_site_config "http"
 
   run_as_root ln -sfn "$NGINX_SITE_FILE" "$NGINX_ENABLED_FILE"
   if run_as_root test -f /etc/nginx/sites-enabled/default; then
     run_as_root rm -f /etc/nginx/sites-enabled/default
   fi
 
+  log "Testing nginx configuration..."
+  run_as_root nginx -t
+  log "Reloading nginx..."
+  run_as_root systemctl reload nginx
+  log "Initial nginx configuration is active."
+}
+
+install_ssl_files_into_nginx() {
+  local cert_path="$1"
+  local key_path="$2"
+
+  write_nginx_site_config "ssl" "$cert_path" "$key_path"
   run_as_root nginx -t
   run_as_root systemctl reload nginx
+  log "Nginx SSL configured."
+}
+
+configure_manual_ssl_files() {
+  if [[ ! -f "$MANUAL_CERT_FULLCHAIN_PATH" || ! -f "$MANUAL_CERT_PRIVKEY_PATH" ]]; then
+    fail "Manual certificate files were not found."
+  fi
+
+  run_silent run_as_root mkdir -p "$CERT_INSTALL_DIR"
+  run_silent run_as_root rm -f "$CERT_INSTALL_DIR/fullchain.pem" "$CERT_INSTALL_DIR/privkey.pem"
+  run_silent run_as_root cp -Lf "$MANUAL_CERT_FULLCHAIN_PATH" "$CERT_INSTALL_DIR/fullchain.pem"
+  run_silent run_as_root cp -Lf "$MANUAL_CERT_PRIVKEY_PATH" "$CERT_INSTALL_DIR/privkey.pem"
+  run_silent run_as_root chmod 644 "$CERT_INSTALL_DIR/fullchain.pem"
+  run_silent run_as_root chmod 600 "$CERT_INSTALL_DIR/privkey.pem"
+
+  install_ssl_files_into_nginx "$CERT_INSTALL_DIR/fullchain.pem" "$CERT_INSTALL_DIR/privkey.pem"
+}
+
+install_lego_certificate_files() {
+  local cert_name="$1"
+  local cert_file="${LEGO_STATE_DIR}/certificates/${cert_name}.crt"
+  local issuer_file="${LEGO_STATE_DIR}/certificates/${cert_name}.issuer.crt"
+  local key_file="${LEGO_STATE_DIR}/certificates/${cert_name}.key"
+
+  [[ -f "$cert_file" ]] || fail "lego certificate file not found: ${cert_file}"
+  [[ -f "$key_file" ]] || fail "lego private key file not found: ${key_file}"
+
+  run_silent run_as_root mkdir -p "$CERT_INSTALL_DIR"
+  run_silent run_as_root env CERT_FILE="$cert_file" ISSUER_FILE="$issuer_file" FULLCHAIN_FILE="$CERT_INSTALL_DIR/fullchain.pem" bash -lc '
+    cat "$CERT_FILE" > "$FULLCHAIN_FILE"
+    if [[ -f "$ISSUER_FILE" ]]; then
+      cat "$ISSUER_FILE" >> "$FULLCHAIN_FILE"
+    fi
+  ' || {
+    fail "Unable to assemble fullchain.pem from lego certificate files."
+  }
+  run_silent run_as_root cp -Lf "$key_file" "$CERT_INSTALL_DIR/privkey.pem"
+  run_silent run_as_root chmod 644 "$CERT_INSTALL_DIR/fullchain.pem"
+  run_silent run_as_root chmod 600 "$CERT_INSTALL_DIR/privkey.pem"
+
+  install_ssl_files_into_nginx "$CERT_INSTALL_DIR/fullchain.pem" "$CERT_INSTALL_DIR/privkey.pem"
+}
+
+configure_lego_ip_ssl() {
+  [[ -n "$CERTBOT_IP_ADDRESS" ]] || fail "Missing public IP address for Certbot IP certificate setup."
+
+  ensure_lego_installed
+  run_silent run_as_root mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
+  run_silent run_as_root mkdir -p "$LEGO_STATE_DIR"
+
+  log "Requesting 6-day IP certificate for ${CERTBOT_IP_ADDRESS} with lego..."
+  run_logged_quiet run_as_root "$LEGO_BIN" \
+    --accept-tos \
+    --email "$CERTBOT_EMAIL" \
+    --path "$LEGO_STATE_DIR" \
+    --disable-cn \
+    --http \
+    --http.webroot "$ACME_WEBROOT" \
+    --domains "$CERTBOT_IP_ADDRESS" \
+    run \
+    --profile shortlived || {
+      warn "ERROR: lego failed for IP ${CERTBOT_IP_ADDRESS}"
+      return 1
+    }
+
+  install_lego_certificate_files "$CERTBOT_IP_ADDRESS"
+  configure_lego_renewal_timer
+  log "Nginx SSL configured for IP ${CERTBOT_IP_ADDRESS}."
+}
+
+configure_lego_renewal_timer() {
+  [[ -x "$LEGO_BIN" ]] || fail "lego binary not found at ${LEGO_BIN}."
+  log "Creating lego renewal service at ${LEGO_RENEW_SERVICE_FILE}..."
+  run_silent run_as_root tee "$LEGO_RENEW_SERVICE_FILE" >/dev/null <<EOF
+[Unit]
+Description=Renew Songbird IP certificate with lego
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=${LEGO_BIN} --accept-tos --email ${CERTBOT_EMAIL} --path ${LEGO_STATE_DIR} --disable-cn --http --http.webroot ${ACME_WEBROOT} --domains ${CERTBOT_IP_ADDRESS} renew --dynamic --profile shortlived
+ExecStartPost=/bin/bash -lc 'cat "${LEGO_STATE_DIR}/certificates/${CERTBOT_IP_ADDRESS}.crt" > "${CERT_INSTALL_DIR}/fullchain.pem" && if [[ -f "${LEGO_STATE_DIR}/certificates/${CERTBOT_IP_ADDRESS}.issuer.crt" ]]; then cat "${LEGO_STATE_DIR}/certificates/${CERTBOT_IP_ADDRESS}.issuer.crt" >> "${CERT_INSTALL_DIR}/fullchain.pem"; fi && cp -Lf "${LEGO_STATE_DIR}/certificates/${CERTBOT_IP_ADDRESS}.key" "${CERT_INSTALL_DIR}/privkey.pem" && chmod 644 "${CERT_INSTALL_DIR}/fullchain.pem" && chmod 600 "${CERT_INSTALL_DIR}/privkey.pem" && systemctl reload nginx'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  log "Creating lego renewal timer at ${LEGO_RENEW_TIMER_FILE}..."
+  run_silent run_as_root tee "$LEGO_RENEW_TIMER_FILE" >/dev/null <<EOF
+[Unit]
+Description=Run Songbird lego renewal twice daily
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=12h
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  run_as_root systemctl daemon-reload
+  run_as_root systemctl enable --now songbird-lego-renew.timer
 }
 
 configure_ssl_if_needed() {
-  if [[ "$DEPLOY_MODE" != "domain" ]]; then
-    log "IP mode selected. Skipping Certbot SSL setup."
+  case "$CERT_MODE" in
+    http)
+      log "HTTP-only mode selected. Skipping TLS setup."
+      return 0
+      ;;
+    files)
+      log "Installing TLS certificate files into nginx..."
+      configure_manual_ssl_files
+      return 0
+      ;;
+  esac
+
+  if [[ "$DEPLOY_MODE" == "ip" ]]; then
+    configure_lego_ip_ssl
     return 0
   fi
 
@@ -1150,6 +1781,7 @@ configure_ssl_if_needed() {
     log "Requesting SSL certificate for: ${uncovered[*]}"
     run_as_root certbot certonly \
       --nginx \
+      --https-port "$CLIENT_PORT" \
       --non-interactive \
       --agree-tos \
       --email "$CERTBOT_EMAIL" \
@@ -1168,9 +1800,10 @@ configure_ssl_if_needed() {
 
   run_as_root certbot install \
     --nginx \
+    --https-port "$CLIENT_PORT" \
     --non-interactive \
     --cert-name "${DOMAIN_NAMES[0]}" \
-    "${all_d_args[@]}" || { log "ERROR: Failed to configure nginx SSL"; return 1; }
+    "${all_d_args[@]}" || { warn "ERROR: Failed to configure nginx SSL"; return 1; }
 
   log "Nginx SSL configured for: ${DOMAIN_NAMES[*]}"
 }
@@ -1186,36 +1819,26 @@ restore_backup_if_provided() {
   if ! have_cmd unzip; then
     fail "unzip is required to restore backups. Install it first and retry."
   fi
-  if ! validate_backup_zip "$DB_BACKUP_PATH"; then
-    fail "Backup validation failed."
+  if [[ ! -d "$INSTALL_DIR/server" ]]; then
+    fail "Server directory not found at ${INSTALL_DIR}/server. Cannot restore backup."
   fi
 
   log "Restoring data from backup: $DB_BACKUP_PATH"
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-
-  local source_dir
-  source_dir="$(extract_backup_zip "$DB_BACKUP_PATH" "$tmp_dir")" || {
-    run_silent run_as_root rm -rf "$tmp_dir"
-    fail "Backup zip does not contain expected songbird.db and uploads/ directory."
-  }
-
-  local db_src="$source_dir/songbird.db"
-  local uploads_src="$source_dir/uploads"
-
-  run_silent run_as_root rm -rf "$INSTALL_DIR/data"
-  run_silent run_as_root mkdir -p "$INSTALL_DIR/data"
-
-  if [[ -f "$db_src" ]]; then
-    run_silent run_as_root cp -a "$db_src" "$INSTALL_DIR/data/"
-  fi
-  if [[ -d "$uploads_src" ]]; then
-    run_silent run_as_root cp -a "$uploads_src" "$INSTALL_DIR/data/"
+  local cmd=(npm --prefix server run db:restore -- -y --file "$DB_BACKUP_PATH")
+  if [[ -n "${DB_BACKUP_PASSWORD:-}" ]]; then
+    cmd+=(--password "$DB_BACKUP_PASSWORD")
   fi
 
-  run_silent run_as_root rm -rf "$tmp_dir"
-  log "Backup restored into ${INSTALL_DIR}/data."
-  apply_ownership
+  if [[ "${RESTORE_BACKUP_QUIET:-no}" == "yes" ]]; then
+    if ! run_db_command_logged_quiet "${cmd[@]}"; then
+      return 1
+    fi
+    return 0
+  fi
+
+  if ! run_db_command "${cmd[@]}"; then
+    return 1
+  fi
 }
 
 backup_database() {
@@ -1223,8 +1846,10 @@ backup_database() {
     warn "Server directory not found; skipping DB backup."
     return 0
   fi
+  local backup_password=""
+  backup_password="$(prompt_secret "Backup password")"
   log "Backing up database before update..."
-  if ! run_in_install_dir "npm --prefix server run db:backup"; then
+  if ! run_in_install_dir "npm --prefix server run db:backup -- --password $(printf '%q' "$backup_password")"; then
     warn "DB backup command failed. Continuing, but verify backups manually."
   fi
 }
@@ -1272,13 +1897,16 @@ update_nginx_runtime_values() {
     "s|proxy_pass http://127\\.0\\.0\\.1:[0-9]+;|proxy_pass http://127.0.0.1:${SERVER_PORT};|g" \
     "$NGINX_SITE_FILE"
 
-  run_silent run_as_root sed -i -E \
-    "s|listen [0-9]+ default_server;|listen ${CLIENT_PORT} default_server;|g" \
-    "$NGINX_SITE_FILE"
+  local existing_cert=""
+  local existing_key=""
+  existing_cert="$(run_as_root_output grep -E '^\s*ssl_certificate ' "$NGINX_SITE_FILE" | head -n 1 | sed -E 's/^\s*ssl_certificate\s+([^;]+);/\1/' | tr -d '\r\n')" || existing_cert=""
+  existing_key="$(run_as_root_output grep -E '^\s*ssl_certificate_key ' "$NGINX_SITE_FILE" | head -n 1 | sed -E 's/^\s*ssl_certificate_key\s+([^;]+);/\1/' | tr -d '\r\n')" || existing_key=""
 
-  run_silent run_as_root sed -i -E \
-    "s|client_max_body_size [^;]+;|client_max_body_size ${MAX_UPLOAD};|g" \
-    "$NGINX_SITE_FILE"
+  if [[ -n "$existing_cert" && -n "$existing_key" ]]; then
+    write_nginx_site_config "ssl" "$existing_cert" "$existing_key"
+  else
+    write_nginx_site_config "http"
+  fi
 
   if run_as_root nginx -t; then
     run_as_root systemctl reload nginx
@@ -1312,9 +1940,55 @@ rebuild_and_restart_after_settings_change() {
 
 update_songbird() {
   if [[ -d "$INSTALL_DIR" ]]; then
-    backup_database
+    if [[ "$(prompt_yes_no "Create a database backup before updating?" "no")" == "yes" ]]; then
+      backup_database
+    else
+      log "Skipping pre-update backup."
+    fi
   else
     warn "No Songbird install found at ${INSTALL_DIR}."
+    press_enter_to_continue
+    return 0
+  fi
+
+  prompt_source_mode
+
+  if [[ "$SOURCE_MODE" == "offline" ]]; then
+    ensure_offline_source_ready "update" || return 0
+
+    local offline_zip_path="$SOURCE_ZIP_PATH"
+    local extract_result=""
+    extract_result="$(extract_offline_source_zip "$offline_zip_path" "update")"
+    local tmp_dir="${extract_result%%|*}"
+    local source_root="${extract_result#*|}"
+
+    if ! offline_source_is_newer "$source_root" "$INSTALL_DIR"; then
+      run_silent run_as_root rm -rf "$tmp_dir"
+      log "Songbird is already up to date. No rebuild needed."
+      press_enter_to_continue
+      return 0
+    fi
+
+    run_silent run_as_root rm -rf "$tmp_dir"
+
+    log "Offline update available. Preparing to update Songbird..."
+    preserve_backup_and_restore_data
+    update_source_from_zip "$offline_zip_path"
+
+    log "Installing dependencies..."
+    install_songbird_dependencies
+    ensure_vapid_keys
+
+    log "Synchronizing database schema with latest version..."
+    run_migrations
+
+    apply_ownership
+
+    log "Restarting Songbird service..."
+    run_as_root systemctl restart songbird.service
+    run_as_root systemctl reload nginx
+
+    log "Update completed successfully."
     press_enter_to_continue
     return 0
   fi
@@ -1463,7 +2137,11 @@ remove_songbird() {
   if run_as_root systemctl list-unit-files | grep -q "^songbird.service"; then
     run_as_root systemctl disable --now songbird.service || true
   fi
+  if run_as_root systemctl list-unit-files | grep -q "^songbird-lego-renew.timer"; then
+    run_as_root systemctl disable --now songbird-lego-renew.timer || true
+  fi
   run_as_root rm -f "$SERVICE_FILE"
+  run_as_root rm -f "$LEGO_RENEW_SERVICE_FILE" "$LEGO_RENEW_TIMER_FILE"
   run_as_root systemctl daemon-reload
 
   run_as_root rm -f "$NGINX_ENABLED_FILE"
@@ -1494,11 +2172,13 @@ remove_songbird() {
 install_songbird() {
   prompt_source_mode
   collect_install_options
+  prompt_install_backup_restore
   install_required_packages
   ensure_nodejs_from_nodesource
   ensure_service_user_exists
   if [[ "$SOURCE_MODE" == "offline" ]]; then
     ensure_offline_source_ready "install" || return 0
+    install_source_from_zip "$SOURCE_ZIP_PATH" || return 1
   else
     clone_repo || {
       warn "Failed to clone repository. Installation canceled."
@@ -1507,23 +2187,52 @@ install_songbird() {
     }
   fi
   ensure_log_dir
-  restore_backup_if_provided
   write_full_env_with_defaults
+  RESTORE_BACKUP_QUIET="yes"
+  if ! restore_backup_if_provided; then
+    RESTORE_BACKUP_QUIET="no"
+    warn "Backup restore failed. Installation aborted. Review ${LOG_FILE} for details."
+    press_enter_to_continue
+    return 1
+  fi
+  RESTORE_BACKUP_QUIET="no"
   install_songbird_dependencies
   ensure_vapid_keys
   apply_ownership
   configure_systemd_service
+  log "Starting nginx setup..."
   configure_nginx
+  log "Starting TLS setup..."
   configure_ssl_if_needed
 
   log "Installation complete."
   log "Songbird has been installed successfully."
-  if [[ "$DEPLOY_MODE" == "domain" ]]; then
+  if [[ "$CERT_MODE" == "http" ]]; then
+    if [[ "$DEPLOY_MODE" == "domain" ]]; then
+      for d in "${DOMAIN_NAMES[@]}"; do
+        log "Visit: http://${d}:${CLIENT_PORT}"
+      done
+    else
+      log "Visit: http://<your-server-ip>:${CLIENT_PORT}"
+    fi
+  elif [[ "$DEPLOY_MODE" == "domain" ]]; then
     for d in "${DOMAIN_NAMES[@]}"; do
-      log "Visit: https://${d}"
+      if [[ "$CLIENT_PORT" == "443" ]]; then
+        log "Visit: https://${d}"
+      else
+        log "Visit: https://${d}:${CLIENT_PORT}"
+      fi
     done
   else
-    log "Visit: http://<your-server-ip>:${CLIENT_PORT}"
+    local visit_ip="${CERTBOT_IP_ADDRESS:-<your-server-ip>}"
+    if [[ "$CERT_MODE" == "files" ]]; then
+      visit_ip="<your-server-ip>"
+    fi
+    if [[ "$CLIENT_PORT" == "443" ]]; then
+      log "Visit: https://${visit_ip}"
+    else
+      log "Visit: https://${visit_ip}:${CLIENT_PORT}"
+    fi
   fi
 
   press_enter_to_continue
@@ -1691,9 +2400,105 @@ run_db_command() {
   run_as_root bash -lc "cd '$INSTALL_DIR' && ${escaped:1}"
 }
 
+run_db_command_logged_quiet() {
+  local args=("$@")
+  local escaped=""
+  local part=""
+  for part in "${args[@]}"; do
+    escaped+=" $(printf '%q' "$part")"
+  done
+  run_logged_quiet run_as_root bash -lc "cd '$INSTALL_DIR' && ${escaped:1}"
+}
+
+resolve_chat_visibility_for_script() {
+  local chat_selector="$1"
+  [[ -n "$chat_selector" ]] || return 1
+
+  run_as_root env INSTALL_DIR="$INSTALL_DIR" CHAT_SELECTOR="$chat_selector" bash -lc '
+    cd "$INSTALL_DIR" || exit 1
+    node --input-type=module -e "
+      import { pathToFileURL } from \"node:url\";
+      const rootUrl = pathToFileURL(process.cwd() + \"/\");
+      const { openDatabase } = await import(new URL(\"./server/scripts/_db-admin.js\", rootUrl));
+      const { resolveChatRow } = await import(new URL(\"./server/lib/dbToolHelpers.js\", rootUrl));
+      const dbApi = await openDatabase();
+      try {
+        const chat = resolveChatRow(dbApi, String(process.env.CHAT_SELECTOR || \"\").trim());
+        if (!chat?.id) {
+          process.exit(2);
+        }
+        process.stdout.write(String(chat.group_visibility || \"public\").trim().toLowerCase() || \"public\");
+      } finally {
+        dbApi.close();
+      }
+    "
+  '
+}
+
+print_db_script_help() {
+  cat <<'EOF'
+Songbird Script Database Menu
+
+Use these menu actions inside this installer script:
+  1-4   Inspect database/chats/users/files
+  5     Backup database and uploads
+  6     Restore a backup zip
+  7     Vacuum the database
+  8-13  Reset/delete/ban file+chat+user data
+  14    Create one user
+  15    Generate users in bulk
+  16    Create a group or channel
+  17    Add members to a chat
+  18    Edit a chat
+  19    Edit a user
+
+Notes:
+  - "Ban/unban user" is a toggle and expires that user's sessions.
+  - Public chats always allow member invites. Invite settings only apply to private chats.
+  - Backups are encrypted zip files containing .env and data/.
+EOF
+}
+
 db_backup() {
+  local backup_password=""
+  backup_password="$(prompt_secret "Backup password")"
   log "Creating backup (db + uploads)..."
-  run_db_command npm --prefix server run db:backup
+  run_db_command npm --prefix server run db:backup -- --password "$backup_password"
+  press_enter_to_continue
+}
+
+db_help() {
+  clear
+  show_banner
+  printf "\n"
+  print_db_script_help
+  press_enter_to_continue
+}
+
+db_vacuum() {
+  if [[ "$(prompt_yes_no "This will run VACUUM and rewrite the database file. Continue?" "no")" != "yes" ]]; then
+    log "VACUUM canceled."
+    return 0
+  fi
+  run_db_command npm --prefix server run db:vacuum -- -y
+  press_enter_to_continue
+}
+
+db_restore() {
+  local backup_path=""
+  local backup_password=""
+
+  backup_path="$(select_backup_zip_path)"
+  if [[ "$(prompt_yes_no "This will replace ${INSTALL_DIR}/data and update ${INSTALL_DIR}/.env when the backup includes it. Continue?" "yes")" != "yes" ]]; then
+    log "Restore canceled."
+    return 0
+  fi
+  backup_password="$(prompt_secret_optional "Backup password (leave blank if not encrypted)")"
+  if [[ -n "$backup_password" ]]; then
+    run_db_command npm --prefix server run db:restore -- -y --file "$backup_path" --password "$backup_password"
+  else
+    run_db_command npm --prefix server run db:restore -- -y --file "$backup_path"
+  fi
   press_enter_to_continue
 }
 
@@ -1806,7 +2611,7 @@ db_user_create() {
   local username=""
   local password=""
 
-  prompt_read "Display name (optional): " nickname
+  nickname="$(prompt_non_empty "Nickname")"
   username="$(prompt_non_empty "Username (lowercase letters, numbers, ., _)")"
   password="$(prompt_secret "Password")"
 
@@ -1849,29 +2654,149 @@ db_user_generate() {
   press_enter_to_continue
 }
 
+db_chat_create() {
+  local type=""
+  local name=""
+  local username=""
+  local visibility=""
+  local owner=""
+  local members=""
+
+  prompt_read "Type (group/channel, default: group): " type
+  type="${type#"${type%%[![:space:]]*}"}"
+  type="${type%"${type##*[![:space:]]}"}"
+  [[ -z "$type" ]] && type="group"
+
+  name="$(prompt_non_empty "Chat name")"
+  username="$(prompt_non_empty "Chat username/handle (without @)")"
+  prompt_read "Visibility (public/private, default: public): " visibility
+  visibility="${visibility#"${visibility%%[![:space:]]*}"}"
+  visibility="${visibility%"${visibility##*[![:space:]]}"}"
+  [[ -z "$visibility" ]] && visibility="public"
+  owner="$(prompt_non_empty "Owner username or id")"
+  prompt_read "Add members (comma separated usernames/ids, optional): " members
+
+  run_db_command npm --prefix server run db:chat:create -- \
+    --type "$type" \
+    --name "$name" \
+    --owner "$owner" \
+    --username "$username" \
+    --visibility "$visibility" \
+    --users "$members"
+  press_enter_to_continue
+}
+
+db_chat_add() {
+  local chat=""
+  local users=""
+  local add_all="no"
+
+  chat="$(prompt_non_empty "Chat id or username")"
+  add_all="$(prompt_yes_no "Add all users in the database to this chat?" "no")"
+
+  if [[ "$add_all" == "yes" ]]; then
+    run_db_command npm --prefix server run db:chat:add -- "$chat" --all
+    press_enter_to_continue
+    return 0
+  fi
+
+  users="$(prompt_non_empty "Usernames or ids (comma separated)")"
+  users="$(printf "%s" "$users" | tr ',' ' ')"
+  run_db_command npm --prefix server run db:chat:add -- "$chat" $users
+  press_enter_to_continue
+}
+
+db_chat_edit() {
+  local chat=""
+  local name=""
+  local username=""
+  local visibility=""
+  local color=""
+  local owner=""
+  local invites=""
+  local effective_visibility=""
+  local args=()
+
+  chat="$(prompt_non_empty "Chat id or username")"
+  prompt_read "New chat name (optional): " name
+  prompt_read "New chat username/handle (optional, without @): " username
+  prompt_read "Visibility (public/private, optional): " visibility
+  prompt_read "Color hex (optional, example: #10b981): " color
+  prompt_read "New owner username or id (optional): " owner
+
+  args+=("$chat")
+  [[ -n "$name" ]] && args+=(--name "$name")
+  [[ -n "$username" ]] && args+=(--username "$username")
+  [[ -n "$visibility" ]] && args+=(--visibility "$visibility")
+  [[ -n "$color" ]] && args+=(--color "$color")
+  [[ -n "$owner" ]] && args+=(--owner "$owner")
+
+  if [[ -n "$visibility" ]]; then
+    effective_visibility="${visibility,,}"
+  else
+    effective_visibility="$(resolve_chat_visibility_for_script "$chat" 2>/dev/null || true)"
+  fi
+
+  if [[ "$effective_visibility" == "private" ]]; then
+    prompt_read "Member invites setting for this private chat (allow/deny, default: allow): " invites
+    invites="${invites#"${invites%%[![:space:]]*}"}"
+    invites="${invites%"${invites##*[![:space:]]}"}"
+    [[ -z "$invites" ]] && invites="allow"
+  else
+    log "Skipping member invites prompt because public chats always allow invites."
+  fi
+
+  if [[ "${invites,,}" == "allow" ]]; then
+    args+=(--allow-member-invites)
+  elif [[ "${invites,,}" == "deny" || "${invites,,}" == "disallow" ]]; then
+    args+=(--disallow-member-invites)
+  fi
+
+  run_db_command npm --prefix server run db:chat:edit -- "${args[@]}"
+  press_enter_to_continue
+}
+
+db_user_edit() {
+  local user=""
+  local username=""
+  local nickname=""
+  local avatar_url=""
+  local status=""
+  local color=""
+  local args=()
+
+  user="$(prompt_non_empty "User id or username")"
+  prompt_read "New username (optional): " username
+  prompt_read "New display name (optional): " nickname
+  prompt_read "Avatar URL (optional): " avatar_url
+  prompt_read "Status (online/invisible, optional): " status
+  prompt_read "Color hex (optional, example: #10b981): " color
+
+  args+=("$user")
+  [[ -n "$username" ]] && args+=(--username "$username")
+  [[ -n "$nickname" ]] && args+=(--nickname "$nickname")
+  [[ -n "$avatar_url" ]] && args+=(--avatar-url "$avatar_url")
+  [[ -n "$status" ]] && args+=(--status "$status")
+  [[ -n "$color" ]] && args+=(--color "$color")
+
+  run_db_command npm --prefix server run db:user:edit -- "${args[@]}"
+  press_enter_to_continue
+}
+
+db_user_ban() {
+  local user=""
+  user="$(prompt_non_empty "User id or username")"
+  if [[ "$(prompt_yes_no "Toggle ban state for ${user} ?" "no")" != "yes" ]]; then
+    log "Ban/unban canceled."
+    return 0
+  fi
+  run_db_command npm --prefix server run db:user:ban -- -y "$user"
+  press_enter_to_continue
+}
+
 db_restore_backup() {
-  local backup_input=""
-  while true; do
-    prompt_read "Enter the full path to the backup .zip file: " backup_input
-    if [[ -z "$backup_input" ]]; then
-      printf "Please provide a file path.\n"
-      continue
-    fi
-    local resolved=""
-    resolved="$(resolve_file_path "$backup_input")" || resolved=""
-    if [[ -z "$resolved" ]]; then
-      printf "File not found. Tried: %s\n" "$backup_input"
-      continue
-    fi
-    if [[ "${resolved,,}" != *.zip ]]; then
-      printf "Backup file must be a .zip archive.\n"
-      continue
-    fi
-    if ! validate_backup_zip "$resolved"; then
-      continue
-    fi
-    break
-  done
+  local resolved=""
+  resolved="$(select_backup_zip_path)"
 
   if [[ "$(prompt_yes_no "This will replace ${INSTALL_DIR}/data. Continue?" "no")" != "yes" ]]; then
     log "Restore canceled."
@@ -1889,36 +2814,52 @@ show_db_menu() {
     show_banner
     printf "\n"
     printf "Manage Database\n"
-    printf $'1) 👁️  Inspect database (summary)\n'
-    printf $'2) 👁️  Inspect chats metadata\n'
-    printf $'3) 👁️  Inspect users\n'
-    printf $'4) 👁️  Inspect files\n'
-    printf $'5) 📤  Backup database\n'
-    printf $'6) 🔄️  Reset database\n'
-    printf $'7) 🗑️  Delete database\n'
-    printf $'8) 🗑️  Delete chats\n'
-    printf $'9) 🗑️  Delete users\n'
-    printf $'10) 🧹  Delete files\n'
-    printf $'11) 👤  Create user\n'
-    printf $'12) 👥  Generate users (bulk)\n'
-    printf $'13) ↩️  Go back\n\n'
+    printf "1) 👁️  Inspect database (summary)\n"
+    printf "2) 👁️  Inspect chats metadata\n"
+    printf "3) 👁️  Inspect users\n"
+    printf "4) 👁️  Inspect files\n"
+    printf "5) 📤  Backup database\n"
+    printf "6) ♻️  Restore backup\n"
+    printf "7) 🧹  Vacuum database\n"
+    printf "8) 🔄️  Reset database\n"
+    printf "9) 🗑️  Delete database\n"
+    printf "10) 🗑️  Delete chats\n"
+    printf "11) 🗑️  Delete users\n"
+    printf "12) 🚫  Ban/unban user\n"
+    printf "13) 🗑️  Delete files\n"
+    printf "14) 👤  Create user\n"
+    printf "15) 👥  Generate users (bulk)\n"
+    printf "16) 💬  Create group/channel\n"
+    printf "17) ➕  Add members to chat\n"
+    printf "18) ✏️  Edit chat\n"
+    printf "19) ✏️ Edit user\n"
+    printf "20) ❔  Show help\n"
+    printf "21) ↩️  Go back\n\n"
 
-    prompt_read "Choose an option [1-13]: " choice
+    prompt_read "Choose an option [1-21]: " choice
     case "$choice" in
       1) db_inspect "all" ;;
       2) db_inspect "chat" ;;
       3) db_inspect "user" ;;
       4) db_inspect "file" ;;
       5) db_backup ;;
-      6) db_reset ;;
-      7) db_delete ;;
-      8) db_chat_delete ;;
-      9) db_user_delete ;;
-      10) db_file_delete ;;
-      11) db_user_create ;;
-      12) db_user_generate ;;
-      13) return ;;
-      *) printf "Invalid choice. Select a number from 1 to 13.\n" ;;
+      6) db_restore ;;
+      7) db_vacuum ;;
+      8) db_reset ;;
+      9) db_delete ;;
+      10) db_chat_delete ;;
+      11) db_user_delete ;;
+      12) db_user_ban ;;
+      13) db_file_delete ;;
+      14) db_user_create ;;
+      15) db_user_generate ;;
+      16) db_chat_create ;;
+      17) db_chat_add ;;
+      18) db_chat_edit ;;
+      19) db_user_edit ;;
+      20) db_help ;;
+      21) return ;;
+      *) printf "Invalid choice. Select a number from 1 to 21.\n" ;;
     esac
   done
 }

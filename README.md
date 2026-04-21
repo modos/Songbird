@@ -190,8 +190,9 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/songbird/server
-ExecStart=/usr/bin/env node index.js
+ExecStart=/usr/bin/env node /opt/songbird/server/index.js
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -297,14 +298,14 @@ sudo systemctl reload nginx
 Request ssl from certbot:
 
 ```bash
-sudo certbot --nginx -d example.com -d www.example.com
+sudo certbot --nginx --https-port 443 -d example.com -d www.example.com
 sudo certbot renew --dry-run
 ```
 
 Or if you are sure you already have ssl for your domain, use this command to only install the certificate on your nginx config:
 
 ```bash
-sudo certbot install --nginx --cert-name example.com www.example.com 
+sudo certbot install --nginx --https-port 443 --cert-name example.com -d example.com -d www.example.com
 ```
 
 ### Option B: Server IP (HTTP)
@@ -417,6 +418,7 @@ cp .env.example .env
 | `FILE_UPLOAD_MAX_FILES` | `integer` | `10` | Max uploaded files in one message. |
 | `FILE_UPLOAD_TRANSCODE_VIDEOS` | `boolean` | `true` | Convert uploaded videos to H.264/AAC MP4 and keep only the converted file. Requires `ffmpeg`. |
 | `MESSAGE_FILE_RETENTION` | `integer` | `7` | Auto-delete uploaded message files after N days (`0` disables). |
+| `MESSAGE_TEXT_RETENTION` | `integer` | `0` | Auto-delete text-only messages after N days (`0` disables). |
 | `MESSAGE_MAX_CHARS` | `integer` | `4000` | Max message length. |
 | `CHAT_PENDING_TEXT_TIMEOUT` | `integer` | `300000` | Mark pending text message as failed after this timeout (milliseconds). |
 | `CHAT_PENDING_FILE_TIMEOUT` | `integer` | `1200000` | Mark pending file message as failed / XHR timeout for uploads (milliseconds). |
@@ -431,13 +433,18 @@ cp .env.example .env
 | `CHAT_HEALTH_CHECK_INTERVAL` | `integer` | `10000` | Connection health check interval (milliseconds). |
 | `CHAT_SSE_RECONNECT_DELAY` | `integer` | `2000` | Delay before reconnecting SSE after error (milliseconds). |
 | `CHAT_SEARCH_MAX_RESULTS` | `integer` | `5` | Max users shown in search results. |
+| `CHAT_VOICE_WAVEFORM_MAX_DECODE_BYTES` | `integer` | `5242880` | Max audio file size (bytes) allowed for client-side waveform decode. |
+| `CHAT_VOICE_WAVEFORM_MAX_DECODE_SECONDS` | `integer` | `480` | Max audio duration (seconds) allowed for client-side waveform decode. |
 | `NICKNAME_MAX` | `integer` | `24` | Max nickname length for users and groups. |
 | `USERNAME_MAX` | `integer` | `16` | Max username length for users and groups. |
-| `VAPID_PUBLIC_KEY` | `string` | `-` | Web Push public key (required for push notifications). |
-| `VAPID_PRIVATE_KEY` | `string` | `-` | Web Push private key (required for push notifications). |
-| `VAPID_SUBJECT` | `string` | `mailto:admin@example.com` | Contact for VAPID (email or URL). Used by push providers. |
+| `STORAGE_ENCRYPTION_KEY` | `string` | auto-generated | Persistent encryption-at-rest key. Changing this value without first decrypting old data will make previously encrypted content unreadable. |
+| `VAPID_PUBLIC_KEY` | `string` | auto-generated | Web Push public key (required for push notifications). |
+| `VAPID_PRIVATE_KEY` | `string` | auto-generated | Web Push private key (required for push notifications). |
+| `VAPID_SUBJECT` | `string` | auto-generated | Contact for VAPID (email or URL). Used by push providers. |
 
 > **Push notifications require HTTPS** (except `localhost` for development). iOS requires an installed PWA (iOS 16.4+).
+
+> **Encryption at rest:** Songbird auto-generates `STORAGE_ENCRYPTION_KEY` on first run and saves it into `.env`. Keep that value stable. On startup, the server backfills existing stored messages and message-upload files into encrypted form when needed.
 
 ### Apply Changes:
 
@@ -489,7 +496,6 @@ sudo systemctl reload nginx
 > docker compose exec songbird npm --prefix /app/server run db:backup
 > ```
 >
-> The backup file will be saved under `/data/backups` directory.
 
 
 ### Docker + Compose
@@ -531,11 +537,19 @@ For zero-downtime deployments on larger projects, consider blue-green deployment
 ## Database commands
 
 - Backup DB: `npm run db:backup`
+- Restore DB backup: `npm run db:restore`
+- Vacuum DB: `npm run db:vacuum`
+- DB command guide: `npm run db:help`
 - Run migrations: `npm run db:migrate`
 - Reset DB: `npm run db:reset`
 - Delete DB: `npm run db:delete`
+- Create a group or channel: `npm run db:chat:create`
+- Add users to a group/channel: `npm run db:chat:add`
+- Edit a group/channel profile or transfer ownership: `npm run db:chat:edit`
 - Delete chats (all or selected ids): `npm run db:chat:delete` (requires `--all` to delete everything)
 - Delete files (all or selected ids/filenames): `npm run db:file:delete`
+- Edit a user profile: `npm run db:user:edit`
+- Toggle user ban/unban: `npm run db:user:ban`
 - Delete users (all or selected ids/usernames): `npm run db:user:delete` (requires `--all` to delete everything)
 - Create one user: `npm run db:user:create`
 - Generate random users: `npm run db:user:generate`
@@ -558,6 +572,10 @@ Examples:
 
 ```bash
 cd server
+npm run db:help
+npm run db:backup
+npm run db:restore -- -y
+npm run db:vacuum -- -y
 npm run db:reset -y
 npm run db:delete --yes
 npm run db:chat:delete 12 -y
@@ -569,10 +587,6 @@ npm run db:user:delete songbird.sage -y
 npm run db:user:delete -- --all -y
 ```
 
-DB admin scripts now support both modes:
-- If server is running on `127.0.0.1:5174`, scripts execute through server admin API.
-- If server is not running, scripts operate directly on the DB file.
-
 ### Admin script usage examples
 
 Create a user:
@@ -580,6 +594,7 @@ Create a user:
 ```bash
 cd server
 npm run db:user:create -- --nickname "Songbird Sage" --username songbird.sage --password "12345678"
+
 # positional alternative:
 npm run db:user:create -- "Songbird Sage" songbird.sage "12345678"
 ```
@@ -591,8 +606,75 @@ cd server
 # npm may warn about unknown cli config if you omit "--".
 # This works reliably:
 npm run db:user:generate -- --count=50 --password="12345678"
+
 # (legacy form still supported if npm allows it):
-# npm run db:user:generate -- --count 50 --password "12345678"
+npm run db:user:generate -- --count 50 --password "12345678"
+```
+
+Create a group or channel:
+
+```bash
+cd server
+npm run db:chat:create -- --type group --name "Core Team" --owner songbird.sage --username core.team --visibility private --users songbird.sage2,songbird.sage3
+
+npm run db:chat:create -- --type channel --name "Announcements" --owner songbird.sage --username announcements
+```
+
+Add users to a group or channel:
+
+```bash
+cd server
+npm run db:chat:add -- core.team songbird.sage2 songbird.sage3
+
+# You can also use chat Id:
+npm run db:chat:add -- 1 --all
+```
+
+Edit a group or channel profile:
+
+```bash
+cd server
+npm run db:chat:edit -- core.team --name "Core Team HQ" --visibility public --color "#14b8a6"
+
+# You can also use chat Id:
+npm run db:chat:edit -- 1 --owner songbird.sage2
+```
+
+Edit a user profile:
+
+```bash
+cd server
+npm run db:user:edit -- songbird.sage --nickname "Songbird Sage" --color "#ff6b6b"
+
+# You can also use user Id:
+npm run db:user:edit -- 1 --username songbird.admin --status invisible
+```
+
+Ban or unban a user:
+
+```bash
+cd server
+npm run db:user:ban -- songbird.sage
+
+# Running it again toggles the state back:
+npm run db:user:ban -- songbird.sage
+```
+
+Restore a backup:
+
+```bash
+cd server
+npm run db:restore -- -y
+```
+
+Backup format:
+
+```text
+songbird-backup-YYYY-MM-DDTHH-MM-SS-sssZ.zip
+|- .env
+`- data/
+   |- songbird.db
+   `- uploads/
 ```
 
 Generate random messages in one chat between two users:
@@ -600,9 +682,11 @@ Generate random messages in one chat between two users:
 ```bash
 cd server
 npm run db:message:generate -- 1 songbird.sage songbird.sage2 300 7
-# users can also be ids:
+
+# You can also use user Id:
 npm run db:message:generate -- 1 2 5 300 7
-# named-arg alternative (avoid --user-a/--user-b because npm may rewrite them):
+
+# named-arg alternative:
 npm run db:message:generate -- --chatId 1 --userA songbird.sage --userB songbird.sage2 --count 300 --days 7
 ```
 

@@ -1,13 +1,62 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import logo from './assets/songbird-logo.svg'
-import ChatPage from './pages/ChatPage.jsx'
-import AuthPage from './pages/AuthPage.jsx'
-import InvitePage from './pages/InvitePage.jsx'
 import { APP_CONFIG } from './settings/appConfig.js'
+import InstallBar from './components/pwa/InstallBar.jsx'
+import InstallGuideModal from './components/pwa/InstallGuideModal.jsx'
 
 const API_BASE = ''
 const AUTH_REDIRECT_KEY = 'songbird-auth-redirect'
 const OPEN_CHAT_ID_KEY = 'songbird-open-chat-id'
+const PWA_INSTALL_DISMISS_KEY = 'songbird-pwa-install-dismissed'
+const PWA_PERMISSIONS_PROMPT_KEY = 'songbird-pwa-permissions-prompt'
+const ROUTE_CHUNK_TELEMETRY_KEY = 'songbird-route-chunk-telemetry-v1'
+const CHUNK_RECOVERY_ATTEMPT_KEY = 'songbird-chunk-recovery-attempted'
+const loadAuthPage = () => import('./pages/AuthPage.jsx')
+const loadChatPage = () => import('./pages/ChatPage.jsx')
+const loadInvitePage = () => import('./pages/InvitePage.jsx')
+const AuthPage = lazy(loadAuthPage)
+const ChatPage = lazy(loadChatPage)
+const InvitePage = lazy(loadInvitePage)
+
+function getPreloadMode() {
+  if (typeof navigator === 'undefined') return 'eager'
+  const connection =
+    navigator.connection || navigator.mozConnection || navigator.webkitConnection
+  if (!connection) return 'eager'
+  if (connection.saveData) return 'idle'
+  const effectiveType = String(connection.effectiveType || '').toLowerCase()
+  if (effectiveType === 'slow-2g' || effectiveType === '2g') return 'idle'
+  return 'eager'
+}
+
+function RouteLoadingFallback({ themeColor, onVisibleChange = null }) {
+  const [dots, setDots] = useState(0)
+  useEffect(() => {
+    onVisibleChange?.(true)
+    const timer = window.setInterval(() => {
+      setDots((prev) => (prev + 1) % 4)
+    }, 180)
+    return () => {
+      window.clearInterval(timer)
+      onVisibleChange?.(false)
+    }
+  }, [onVisibleChange])
+
+  const content = (
+    <div
+      className="fixed inset-0 z-[1200] flex min-h-screen w-full items-center justify-center"
+      style={{ backgroundColor: themeColor }}
+    >
+      <div className="flex flex-col items-center gap-3 text-center text-emerald-700 dark:text-emerald-300">
+        <img src={logo} alt="Songbird logo" className="h-10 w-10 animate-pulse" />
+        <p className="text-xs font-semibold tracking-wide">{`Loading${'.'.repeat(dots)}`}</p>
+      </div>
+    </div>
+  )
+  if (typeof document === 'undefined' || !document.body) return content
+  return createPortal(content, document.body)
+}
 
 function getRoute(pathname) {
   if (pathname === '/signup') return 'signup'
@@ -21,12 +70,65 @@ function getInviteToken(pathname) {
   return pathname.slice('/invite/'.length).trim()
 }
 
+function isChunkLoadFailure(error) {
+  const text = String(error?.message || error || '')
+  return (
+    text.includes('Failed to fetch dynamically imported module') ||
+    text.includes('Importing a module script failed') ||
+    text.includes('error loading dynamically imported module') ||
+    text.includes('Unable to preload CSS for')
+  )
+}
+
 export default function App() {
+  async function recoverFromStaleShell() {
+    if (typeof window === 'undefined') return
+    if (window.sessionStorage.getItem(CHUNK_RECOVERY_ATTEMPT_KEY) === '1') return
+    window.sessionStorage.setItem(CHUNK_RECOVERY_ATTEMPT_KEY, '1')
+
+    try {
+      if ('serviceWorker' in navigator) {
+        const registrations = await navigator.serviceWorker.getRegistrations()
+        await Promise.all(
+          registrations.map((registration) => registration.unregister()),
+        )
+      }
+    } catch {
+      // ignore cleanup failures
+    }
+
+    try {
+      if (typeof window.caches?.keys === 'function') {
+        const keys = await window.caches.keys()
+        await Promise.all(
+          keys
+            .filter((key) => key.startsWith('songbird-'))
+            .map((key) => window.caches.delete(key)),
+        )
+      }
+    } catch {
+      // ignore cleanup failures
+    }
+
+    window.location.reload()
+  }
+
+  const resolveAutoThemeIsDark = () => {
+    try {
+      if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+        return true
+      }
+      return window.matchMedia('(prefers-color-scheme: dark)').matches
+    } catch {
+      return true
+    }
+  }
+
   const [isDark, setIsDark] = useState(() => {
     const stored = localStorage.getItem('songbird-theme')
     if (stored === 'light') return false
     if (stored === 'dark') return true
-    return true
+    return resolveAutoThemeIsDark()
   })
   const [route, setRoute] = useState(() => getRoute(window.location.pathname))
   const [inviteToken, setInviteToken] = useState(() =>
@@ -37,11 +139,38 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false)
   const [authLoading, setAuthLoading] = useState(false)
   const accountCreationEnabled = APP_CONFIG.accountCreationEnabled
+  const isStandaloneDisplay =
+    window.matchMedia?.('(display-mode: standalone)')?.matches ||
+    window.navigator?.standalone
+  const isIOS = /iP(ad|hone|od)/i.test(navigator.userAgent)
+  const isIOSFirefox = /FxiOS/i.test(navigator.userAgent)
   const isIOSSafari =
-    /iP(ad|hone|od)/i.test(navigator.userAgent) &&
+    isIOS &&
     /Safari/i.test(navigator.userAgent) &&
     !/CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo/i.test(navigator.userAgent)
+  const [installPromptEvent, setInstallPromptEvent] = useState(null)
+  const [showInstallBanner, setShowInstallBanner] = useState(false)
+  const [installDismissed, setInstallDismissed] = useState(() => {
+    return localStorage.getItem(PWA_INSTALL_DISMISS_KEY) === '1'
+  })
+  const [installForceHidden, setInstallForceHidden] = useState(false)
+  const [showIosInstallBanner, setShowIosInstallBanner] = useState(() => {
+    if (!isIOS || isStandaloneDisplay) return false
+    return localStorage.getItem(PWA_INSTALL_DISMISS_KEY) !== '1'
+  })
+  const [showInstallGuide, setShowInstallGuide] = useState(false)
+  const [routeChunkLoading, setRouteChunkLoading] = useState(false)
+  const preloadedRoutesRef = useRef(new Set())
+  const routeChunkLoadStartRef = useRef(0)
+  const installBarRef = useRef(null)
+  const [installBarHeight, setInstallBarHeight] = useState(0)
   const themeRefreshTimersRef = useRef([])
+  const isDesktopViewport =
+    window.matchMedia?.('(min-width: 768px)')?.matches || false
+  const showInstallBar =
+    !isStandaloneDisplay &&
+    !installDismissed &&
+    (showInstallBanner || showIosInstallBanner || isDesktopViewport)
 
   function normalizeSessionUser(data) {
     if (!data?.username) return null
@@ -218,15 +347,269 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    window.sessionStorage.removeItem(CHUNK_RECOVERY_ATTEMPT_KEY)
+  }, [])
+
+  useEffect(() => {
+    const handleError = (event) => {
+      if (!isChunkLoadFailure(event?.error || event?.message)) return
+      event.preventDefault?.()
+      void recoverFromStaleShell()
+    }
+
+    const handleRejection = (event) => {
+      if (!isChunkLoadFailure(event?.reason)) return
+      event.preventDefault?.()
+      void recoverFromStaleShell()
+    }
+
+    window.addEventListener('error', handleError)
+    window.addEventListener('unhandledrejection', handleRejection)
+    return () => {
+      window.removeEventListener('error', handleError)
+      window.removeEventListener('unhandledrejection', handleRejection)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (isStandaloneDisplay) return
+    const dismissed = localStorage.getItem(PWA_INSTALL_DISMISS_KEY) === '1'
+    if (dismissed) return
+    const handleBeforeInstallPrompt = (event) => {
+      event.preventDefault()
+      setInstallPromptEvent(event)
+      setShowInstallBanner(true)
+    }
+    const handleInstalled = () => {
+      setInstallPromptEvent(null)
+      setShowInstallBanner(false)
+      setShowIosInstallBanner(false)
+      setInstallDismissed(true)
+      localStorage.setItem(PWA_INSTALL_DISMISS_KEY, '1')
+      localStorage.setItem(PWA_PERMISSIONS_PROMPT_KEY, 'pending')
+    }
+    const handleHideInstall = () => setInstallForceHidden(true)
+    const handleShowInstall = () => setInstallForceHidden(false)
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
+    window.addEventListener('appinstalled', handleInstalled)
+    window.addEventListener('songbird-hide-install-bar', handleHideInstall)
+    window.addEventListener('songbird-show-install-bar', handleShowInstall)
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
+      window.removeEventListener('appinstalled', handleInstalled)
+      window.removeEventListener('songbird-hide-install-bar', handleHideInstall)
+      window.removeEventListener('songbird-show-install-bar', handleShowInstall)
+    }
+  }, [isStandaloneDisplay])
+
+  useEffect(() => {
+    if (!APP_CONFIG.debugEnabled) {
+      routeChunkLoadStartRef.current = 0
+      return
+    }
+    if (routeChunkLoading) {
+      routeChunkLoadStartRef.current = performance.now()
+      return
+    }
+    const startedAt = Number(routeChunkLoadStartRef.current || 0)
+    if (!startedAt) return
+    routeChunkLoadStartRef.current = 0
+    const durationMs = Math.max(0, performance.now() - startedAt)
+    if (durationMs < 20) return
+    try {
+      const raw = localStorage.getItem(ROUTE_CHUNK_TELEMETRY_KEY)
+      const parsed = JSON.parse(raw || '[]')
+      const items = Array.isArray(parsed) ? parsed : []
+      items.push({
+        t: Date.now(),
+        route,
+        durationMs: Math.round(durationMs),
+      })
+      localStorage.setItem(
+        ROUTE_CHUNK_TELEMETRY_KEY,
+        JSON.stringify(items.slice(-80)),
+      )
+    } catch {
+      // ignore telemetry storage failures
+    }
+  }, [route, routeChunkLoading])
+
+  useEffect(() => {
+    let cancelled = false
+    let idleId = null
+    let timerId = null
+    const mode = getPreloadMode()
+
+    const preloadKey = (key, loader) => {
+      if (preloadedRoutesRef.current.has(key)) return
+      preloadedRoutesRef.current.add(key)
+      void loader().catch(() => {
+        preloadedRoutesRef.current.delete(key)
+      })
+    }
+
+    const preloadLikelyRoutes = () => {
+      if (cancelled) return
+      if (route === 'login' || route === 'signup') {
+        preloadKey('chat', loadChatPage)
+        return
+      }
+      if (route === 'invite') {
+        preloadKey('chat', loadChatPage)
+        preloadKey('auth', loadAuthPage)
+        return
+      }
+      if (route === 'chat') {
+        preloadKey('invite', loadInvitePage)
+        return
+      }
+      preloadKey('auth', loadAuthPage)
+    }
+
+    const warmupMarkdownRendering = () => {
+      if (cancelled) return
+      if (route !== 'chat') return
+      void import('./utils/markdown.js')
+        .then((mod) => {
+          mod?.preloadMarkdownHighlighter?.()
+        })
+        .catch(() => {})
+    }
+
+    const triggerPreload = () => {
+      preloadLikelyRoutes()
+      warmupMarkdownRendering()
+    }
+
+    if (mode === 'eager') {
+      timerId = window.setTimeout(triggerPreload, 80)
+    } else if (typeof window.requestIdleCallback === 'function') {
+      idleId = window.requestIdleCallback(triggerPreload, { timeout: 1600 })
+    } else {
+      timerId = window.setTimeout(triggerPreload, 650)
+    }
+
+    window.addEventListener('pointerdown', triggerPreload, {
+      once: true,
+      passive: true,
+      capture: true,
+    })
+    window.addEventListener('keydown', triggerPreload, {
+      once: true,
+      passive: true,
+      capture: true,
+    })
+
+    return () => {
+      cancelled = true
+      if (timerId !== null) {
+        window.clearTimeout(timerId)
+      }
+      if (
+        idleId !== null &&
+        typeof window.cancelIdleCallback === 'function'
+      ) {
+        window.cancelIdleCallback(idleId)
+      }
+      window.removeEventListener('pointerdown', triggerPreload, {
+        capture: true,
+      })
+      window.removeEventListener('keydown', triggerPreload, {
+        capture: true,
+      })
+    }
+  }, [route])
+
+  useLayoutEffect(() => {
+    const barNode = installBarRef.current
+    if (!barNode) {
+      setInstallBarHeight(0)
+      return
+    }
+    const measure = () => {
+      const rect = barNode.getBoundingClientRect()
+      setInstallBarHeight(Number(rect?.height || 0))
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => measure())
+    observer.observe(barNode)
+    return () => observer.disconnect()
+  }, [showInstallBanner, showIosInstallBanner])
+
+  useEffect(() => {
     const root = document.documentElement
+    const effectiveHeight =
+      showInstallBar && !installForceHidden ? `${installBarHeight}px` : '0px'
+    root.style.setProperty('--install-bar-height', effectiveHeight)
+    root.style.setProperty(
+      '--install-bar-opacity',
+      showInstallBar && !installForceHidden ? '1' : '0',
+    )
+    root.style.setProperty(
+      '--install-bar-pe',
+      showInstallBar && !installForceHidden ? 'auto' : 'none',
+    )
+    root.style.setProperty(
+      '--install-bar-translate',
+      showInstallBar && !installForceHidden ? '0%' : '-110%',
+    )
+    root.style.setProperty(
+      '--install-bar-z',
+      routeChunkLoading ? '10' : '40',
+    )
+  }, [installBarHeight, installForceHidden, showInstallBar, routeChunkLoading])
+
+  useEffect(() => {
+    if (!isStandaloneDisplay) return
+    if (typeof window === 'undefined') return
+    const flag = localStorage.getItem(PWA_PERMISSIONS_PROMPT_KEY)
+    if (flag !== 'pending') return
+    localStorage.setItem(PWA_PERMISSIONS_PROMPT_KEY, 'done')
+    const triggerPrompts = () => {
+      if (typeof Notification !== 'undefined') {
+        try {
+          if (
+            typeof Notification.requestPermission === 'function' &&
+            Notification.permission === 'default'
+          ) {
+            Notification.requestPermission().catch(() => {})
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (navigator.mediaDevices?.getUserMedia) {
+        navigator.mediaDevices
+          .getUserMedia({ audio: true })
+          .then((stream) => {
+            stream?.getTracks?.().forEach((track) => track.stop())
+          })
+          .catch(() => {})
+      }
+    }
+    const timer = window.setTimeout(triggerPrompts, 600)
+    return () => window.clearTimeout(timer)
+  }, [isStandaloneDisplay])
+
+  useEffect(() => {
+    const root = document.documentElement
+    if (isIOSFirefox) {
+      root.style.setProperty('--vv-bottom-offset', '0px')
+      root.style.setProperty('--mobile-bottom-offset', '0px')
+      root.style.setProperty('--vv-top-offset', '0px')
+      return
+    }
     const viewport = window.visualViewport
     if (!viewport) {
       root.style.setProperty('--vv-bottom-offset', '0px')
       root.style.setProperty('--mobile-bottom-offset', '0px')
+      root.style.setProperty('--vv-top-offset', '0px')
       return
     }
 
     const updateViewportOffset = () => {
+      const topOffset = Math.max(0, Number(viewport.offsetTop || 0))
       const activeEl = document.activeElement
       const focusedEditable =
         !!activeEl &&
@@ -240,6 +623,10 @@ export default function App() {
       const offset = focusedEditable && keyboardLikelyOpen ? 0 : 0
       root.style.setProperty('--vv-bottom-offset', `${offset}px`)
       root.style.setProperty('--mobile-bottom-offset', `${offset}px`)
+      root.style.setProperty(
+        '--vv-top-offset',
+        `${focusedEditable && keyboardLikelyOpen ? topOffset : 0}px`,
+      )
     }
 
     updateViewportOffset()
@@ -254,7 +641,7 @@ export default function App() {
       window.removeEventListener('focusin', updateViewportOffset)
       window.removeEventListener('focusout', updateViewportOffset)
     }
-  }, [])
+  }, [isIOSFirefox])
 
 
   useEffect(() => {
@@ -343,7 +730,15 @@ export default function App() {
         body: JSON.stringify(payload),
         credentials: 'include',
       })
-      const data = await res.json()
+      let data = {}
+      const contentType = res.headers.get('content-type')
+      if (contentType && contentType.includes('application/json')) {
+        try {
+          data = await res.json()
+        } catch {
+          data = {}
+        }
+      }
       if (!res.ok) {
         throw new Error(data?.error || 'Unable to sign in.')
       }
@@ -399,7 +794,15 @@ export default function App() {
         body: JSON.stringify(payload),
         credentials: 'include',
       })
-      const registerData = await registerRes.json()
+      let registerData = {}
+      const contentType = registerRes.headers.get('content-type')
+      if (contentType && contentType.includes('application/json')) {
+        try {
+          registerData = await registerRes.json()
+        } catch {
+          registerData = {}
+        }
+      }
       if (!registerRes.ok) {
         throw new Error(registerData?.error || 'Unable to create account.')
       }
@@ -421,9 +824,32 @@ export default function App() {
     ? 'min-h-screen bg-gradient-to-b from-white via-emerald-50/70 to-white text-slate-900 transition-colors duration-300 dark:bg-gradient-to-b dark:from-emerald-950 dark:via-slate-950 dark:to-slate-900 dark:text-slate-100'
     : 'h-[100dvh] bg-white text-slate-900 transition-colors duration-300 dark:bg-slate-950 dark:text-slate-100'
 
+  const appContainerStyle = {
+    paddingTop: 'var(--install-bar-height, 0px)',
+    transition: 'padding-top 220ms ease',
+  }
+  const authViewportStyle = isAuthRoute
+    ? {
+        minHeight: 'calc(100dvh - var(--install-bar-height, 0px))',
+        height: 'calc(100dvh - var(--install-bar-height, 0px))',
+      }
+    : undefined
+  const authContentStyle = isAuthRoute
+    ? {
+        minHeight: 'calc(100dvh - var(--install-bar-height, 0px))',
+      }
+    : undefined
+
   return (
-    <div className={appShellClass}>
-      <div className={isAuthRoute ? 'relative min-h-screen overflow-hidden' : 'relative h-full min-h-0 overflow-hidden'}>
+    <div className={appShellClass} style={appContainerStyle}>
+      <div
+        className={
+          isAuthRoute
+            ? 'relative min-h-screen app-scroll overflow-y-auto'
+            : 'relative h-full min-h-0 overflow-hidden'
+        }
+        style={authViewportStyle}
+      >
         {!isAuthRoute ? (
           <>
             {isIOSSafari ? (
@@ -468,17 +894,21 @@ export default function App() {
         ) : null}
         {isAuthRoute ? (
           <>
-            <div className="pointer-events-none absolute -top-40 left-1/2 h-96 w-96 -translate-x-1/2 rounded-full bg-emerald-400/30 blur-[130px]" />
-            <div className="pointer-events-none absolute bottom-0 right-0 h-80 w-80 translate-x-1/3 rounded-full bg-lime-400/40 blur-[120px]" />
+            <div className="pointer-events-none fixed -top-40 left-1/2 h-96 w-96 -translate-x-1/2 rounded-full bg-emerald-400/30 blur-[130px]" />
+            <div className="pointer-events-none fixed bottom-0 right-0 h-80 w-80 translate-x-1/3 rounded-full bg-lime-400/40 blur-[120px]" />
           </>
         ) : null}
 
         <div
           className={
             isAuthRoute
-              ? 'app-scroll mx-auto flex min-h-screen w-full max-w-6xl flex-col overflow-y-auto px-4 pb-8 pt-6 sm:px-6 sm:pb-16 sm:pt-10'
-              : 'relative z-10 flex h-full min-h-0 w-full flex-col px-0 pb-0 pt-0'
+              ? 'mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 pb-8 pt-6 sm:px-6 sm:pb-16 sm:pt-10'
+              : 'relative flex h-full min-h-0 w-full flex-col px-0 pb-0 pt-0'
           }
+          style={{
+            ...(authContentStyle || {}),
+            zIndex: routeChunkLoading ? '70' : 'var(--app-z, 20)',
+          }}
         >
           {isAuthRoute ? (
             <header className="flex flex-wrap items-center justify-center gap-3 text-center sm:gap-4">
@@ -493,62 +923,111 @@ export default function App() {
             </header>
           ) : null}
 
-          <main className={isAuthRoute ? 'app-scroll flex flex-1 items-center justify-center overflow-y-auto px-1 py-6 sm:mt-0 sm:px-0 sm:py-8' : 'flex min-h-0 flex-1'}>
-            {route === 'login' && (
-              <AuthPage
-                mode="login"
-                isDark={isDark}
-                onToggleTheme={toggleTheme}
-                onSubmit={handleLogin}
-                onSwitchMode={() => {
-                  setAuthStatus('')
-                  navigate('/signup')
-                }}
-                status={authStatus}
-                loading={authLoading}
-                showSigningOverlay={authLoading}
-                allowSignup={accountCreationEnabled}
-              />
-            )}
-            {route === 'signup' && (
-              <AuthPage
-                mode="signup"
-                isDark={isDark}
-                onToggleTheme={toggleTheme}
-                onSubmit={handleSignup}
-                onSwitchMode={() => {
-                  setAuthStatus('')
-                  navigate('/login')
-                }}
-                status={authStatus}
-                loading={authLoading}
-                showSigningOverlay={false}
-                allowSignup={accountCreationEnabled}
-              />
-            )}
-            {route === 'chat' && user ? (
-              <ChatPage user={user} setUser={setUser} isDark={isDark} setIsDark={setIsDark} toggleTheme={toggleTheme} />
-            ) : null}
-            {route === 'invite' && user ? (
-              <InvitePage
-                token={inviteToken}
-                user={user}
-                isDark={isDark}
-                onToggleTheme={toggleTheme}
-                onNavigateChat={(chatId = 0) => {
-                  const nextChatId = Number(chatId || 0)
-                  if (nextChatId > 0) {
-                    window.sessionStorage.setItem(OPEN_CHAT_ID_KEY, String(nextChatId))
-                  }
-                  navigate('/chat', true)
-                }}
-                onRequireLogin={() => navigate('/login', true)}
-              />
-            ) : null}
+          <main className={isAuthRoute ? 'flex flex-1 items-center justify-center px-1 py-6 sm:mt-0 sm:px-0 sm:py-8' : 'flex min-h-0 flex-1'}>
+            <Suspense
+              fallback={
+                <RouteLoadingFallback
+                  themeColor={safeAreaThemeColor}
+                  onVisibleChange={setRouteChunkLoading}
+                />
+              }
+            >
+              {route === 'login' && (
+                <AuthPage
+                  mode="login"
+                  isDark={isDark}
+                  onToggleTheme={toggleTheme}
+                  onSubmit={handleLogin}
+                  onSwitchMode={() => {
+                    setAuthStatus('')
+                    navigate('/signup')
+                  }}
+                  status={authStatus}
+                  loading={authLoading}
+                  showSigningOverlay={authLoading}
+                  allowSignup={accountCreationEnabled}
+                />
+              )}
+              {route === 'signup' && (
+                <AuthPage
+                  mode="signup"
+                  isDark={isDark}
+                  onToggleTheme={toggleTheme}
+                  onSubmit={handleSignup}
+                  onSwitchMode={() => {
+                    setAuthStatus('')
+                    navigate('/login')
+                  }}
+                  status={authStatus}
+                  loading={authLoading}
+                  showSigningOverlay={false}
+                  allowSignup={accountCreationEnabled}
+                />
+              )}
+              {route === 'chat' && user ? (
+                <ChatPage user={user} setUser={setUser} isDark={isDark} setIsDark={setIsDark} toggleTheme={toggleTheme} />
+              ) : null}
+              {route === 'invite' && user ? (
+                <InvitePage
+                  token={inviteToken}
+                  user={user}
+                  isDark={isDark}
+                  onToggleTheme={toggleTheme}
+                  onNavigateChat={(chatId = 0) => {
+                    const nextChatId = Number(chatId || 0)
+                    if (nextChatId > 0) {
+                      window.sessionStorage.setItem(OPEN_CHAT_ID_KEY, String(nextChatId))
+                    }
+                    navigate('/chat', true)
+                  }}
+                  onRequireLogin={() => navigate('/login', true)}
+                />
+              ) : null}
+            </Suspense>
           </main>
         </div>
       </div>
+
+      <InstallBar
+        ref={installBarRef}
+        show={showInstallBar}
+        iconSrc="/icons/icon-192.png"
+        onDismiss={() => {
+          setShowInstallBanner(false)
+          setShowIosInstallBanner(false)
+          setInstallDismissed(true)
+          localStorage.setItem(PWA_INSTALL_DISMISS_KEY, '1')
+        }}
+        onInstall={async () => {
+          if (installPromptEvent) {
+            try {
+              if (typeof installPromptEvent.prompt !== 'function') {
+                throw new Error('Install prompt unavailable')
+              }
+              await installPromptEvent.prompt()
+              const choice = await installPromptEvent.userChoice
+              if (choice?.outcome !== 'accepted') {
+                setInstallDismissed(true)
+                localStorage.setItem(PWA_INSTALL_DISMISS_KEY, '1')
+              }
+            } catch {
+              setShowInstallGuide(true)
+            } finally {
+              setInstallPromptEvent(null)
+              setShowInstallBanner(false)
+            }
+            return
+          }
+          setShowInstallGuide(true)
+        }}
+      />
+
+      <InstallGuideModal
+        open={showInstallGuide}
+        iconSrc="/icons/icon-192.png"
+        isDesktop={isDesktopViewport}
+        onClose={() => setShowInstallGuide(false)}
+      />
     </div>
   )
 }
-

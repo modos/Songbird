@@ -218,8 +218,17 @@ function registerProfileRoutes(app, deps) {
       removeAvatarByUrl(user.avatar_url);
     }
 
-    return res.json({
+    updateUserProfile(
+      user.id,
+      user.username,
+      user.nickname || null,
       avatarUrl,
+    );
+
+    const updated = findUserById(user.id);
+
+    return res.json({
+      avatarUrl: ensureAvatarExists(updated.id, updated.avatar_url) || avatarUrl,
       sizeBytes: Number(file.size || 0),
       maxFileSizeBytes: AVATAR_FILE_LIMITS.maxFileSizeBytes,
     });
@@ -264,7 +273,7 @@ function registerProfileRoutes(app, deps) {
       return res.status(400).json({ error: "Username and status are required." });
     }
 
-    const allowed = new Set(["online", "idle", "invisible"]);
+    const allowed = new Set(["online", "invisible"]);
     if (!allowed.has(status)) {
       return res.status(400).json({ error: "Invalid status." });
     }

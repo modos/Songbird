@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { LoaderCircle, Moon, Sun, Users, LogIn } from "../icons/lucide.js";
 import { getGroupInviteInfo, joinGroupByInvite } from "../api/chatApi.js";
 import { getAvatarStyle } from "../utils/avatarColor.js";
@@ -18,6 +18,8 @@ export default function InvitePage({
   const [error, setError] = useState("");
   const [group, setGroup] = useState(null);
   const [alreadyMember, setAlreadyMember] = useState(false);
+  const cardRef = useRef(null);
+  const [fitsViewport, setFitsViewport] = useState(true);
   const parseResponseBody = async (res) => {
     const contentType = String(
       res.headers.get("content-type") || "",
@@ -32,6 +34,10 @@ export default function InvitePage({
     const text = await res.text().catch(() => "");
     return { error: text };
   };
+  const normalizeInviteError = (value) =>
+    String(value || "")
+      .replace(/removed from this group/gi, "removed from this chat")
+      .replace(/join this group/gi, "join this chat");
 
   useEffect(() => {
     if (!token) {
@@ -51,14 +57,20 @@ export default function InvitePage({
         }
         const data = await parseResponseBody(res);
         if (!res.ok) {
-          throw new Error(data?.error || "Unable to validate invite link.");
+          throw new Error(
+            normalizeInviteError(
+              data?.error || "Unable to validate invite link.",
+            ),
+          );
         }
         if (!mounted) return;
         setGroup(data?.group || null);
         setAlreadyMember(Boolean(data?.alreadyMember));
       } catch (err) {
         if (!mounted) return;
-        setError(err.message || "Unable to validate invite link.");
+        setError(
+          normalizeInviteError(err.message || "Unable to validate invite link."),
+        );
       } finally {
         if (mounted) setLoading(false);
       }
@@ -68,6 +80,41 @@ export default function InvitePage({
       mounted = false;
     };
   }, [token, onRequireLogin]);
+
+  useLayoutEffect(() => {
+    const node = cardRef.current;
+    if (!node || typeof window === "undefined") return;
+
+    const measure = () => {
+      const parentHeight = Number(node.parentElement?.clientHeight || 0);
+      const viewportHeight = Number(window.visualViewport?.height || window.innerHeight || 0);
+      const availableHeight = parentHeight || viewportHeight;
+      const cardHeight = Math.ceil(node.getBoundingClientRect().height);
+      setFitsViewport(cardHeight <= Math.max(availableHeight - 8, 0));
+    };
+
+    measure();
+    const rafId = window.requestAnimationFrame(measure);
+    const timeoutId = window.setTimeout(measure, 120);
+    const observer =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(() => measure())
+        : null;
+    observer?.observe(node);
+    if (node.parentElement) {
+      observer?.observe(node.parentElement);
+    }
+    window.addEventListener("resize", measure);
+    window.visualViewport?.addEventListener("resize", measure);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.clearTimeout(timeoutId);
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+      window.visualViewport?.removeEventListener("resize", measure);
+    };
+  }, [alreadyMember, error, group, joining, loading]);
 
   const handleJoin = async () => {
     if (!token || !user?.username) return;
@@ -87,11 +134,13 @@ export default function InvitePage({
           onNavigateChat?.(Number(checkData.group.id));
           return;
         }
-        throw new Error(data?.error || "Unable to join this group.");
+        throw new Error(
+          normalizeInviteError(data?.error || "Unable to join this chat."),
+        );
       }
       onNavigateChat?.(Number(data?.id || 0));
     } catch (err) {
-      setError(err.message || "Unable to join this group.");
+      setError(normalizeInviteError(err.message || "Unable to join this chat."));
     } finally {
       setJoining(false);
     }
@@ -107,6 +156,7 @@ export default function InvitePage({
 
   const groupType = group?.type === "channel" ? "Channel" : "Group";
   const groupName = group?.name || groupType;
+  const groupNameHasPersian = hasPersian(groupName);
   const groupInitials = getAvatarInitials(groupName);
   const rawGroupAvatarUrl = String(group?.avatarUrl || "").trim();
   const groupAvatarUrl = rawGroupAvatarUrl.startsWith("/uploads/")
@@ -114,7 +164,12 @@ export default function InvitePage({
     : rawGroupAvatarUrl;
 
   return (
-    <section className="app-scroll relative my-auto w-full max-w-md max-h-[calc(100dvh-5.5rem)] overflow-y-auto rounded-3xl border border-emerald-200/70 bg-white/80 p-6 shadow-2xl shadow-emerald-500/10 backdrop-blur dark:border-white/5 dark:bg-slate-900/80 sm:max-h-none sm:overflow-visible sm:p-8">
+    <section
+      ref={cardRef}
+      className={`relative w-full max-w-md rounded-3xl border border-emerald-200/70 bg-white/80 p-6 shadow-2xl shadow-emerald-500/10 backdrop-blur dark:border-white/5 dark:bg-slate-900/80 sm:p-8 ${
+        fitsViewport ? "my-auto self-center" : "my-0 self-start"
+      }`}
+    >
       <div className="relative text-center">
         <p className="text-xs font-semibold uppercase tracking-[0.25em] text-emerald-600 dark:text-emerald-300 sm:text-sm">
           {groupType} Invite
@@ -172,16 +227,24 @@ export default function InvitePage({
                   {groupInitials}
                 </div>
               )}
-              <p
-                className="truncate text-base font-semibold text-emerald-800 dark:text-emerald-200"
-                dir="auto"
-                title={groupName}
-              >
-                {groupName}
+              <p className="w-full text-center">
+                <span
+                  className={`mx-auto block w-fit max-w-full truncate text-base font-semibold text-emerald-800 dark:text-emerald-200 ${
+                    groupNameHasPersian ? "font-fa text-right" : "text-center"
+                  }`}
+                  dir="auto"
+                  style={{ unicodeBidi: "plaintext" }}
+                  title={groupName}
+                >
+                  {groupName}
+                </span>
               </p>
               <p
-                className="mt-1 truncate text-xs text-slate-600 dark:text-slate-300"
+                className={`mt-1 w-full truncate text-xs text-slate-600 dark:text-slate-300 ${
+                  hasPersian(group?.username || "") ? "font-fa text-right" : "text-center"
+                }`}
                 dir="auto"
+                style={{ unicodeBidi: "plaintext" }}
                 title={group?.username || "group"}
               >
                 @{group?.username || "group"}

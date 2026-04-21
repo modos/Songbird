@@ -1,18 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import MobileTabMenu from "../components/MobileTabMenu.jsx";
-import ChatWindowPanel from "../components/ChatWindowPanel.jsx";
-import ChatProfileModal from "../components/ChatProfileModal.jsx";
-import {
-  DeleteChatsModal,
-  GroupInviteLinkModal,
-  NewChatModal,
-  NewGroupModal,
-} from "../components/ChatModals.jsx";
-import { DesktopSettingsModal, NotificationsSettingsModal } from "../components/settings/index.js";
-import { ChatSidebar } from "../components/chatpage/index.js";
+import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import MobileTabMenu from "../components/navigation/MobileTabMenu.jsx";
+import ChatWindowPanel from "../components/chat/ChatWindowPanel.jsx";
+import { ChatSidebar } from "../components/sidebar/index.js";
+import AppContextMenu from "../components/context-menu/AppContextMenu.jsx";
+import { useAppContextMenu } from "../components/context-menu/useAppContextMenu.js";
 import { CHAT_PAGE_CONFIG } from "../settings/chatPageConfig.js";
 import { getAvatarInitials } from "../utils/avatarInitials.js";
 import { NICKNAME_MAX, USERNAME_MAX } from "../utils/nameLimits.js";
+import { resolveReplyPreview, summarizeFiles, truncateText } from "../utils/messagePreview.js";
 import {
   formatBytesAsMb,
   formatChatCardTimestamp,
@@ -20,28 +15,59 @@ import {
   formatTime,
   parseServerDate,
 } from "../utils/chatFormat.js";
-import { useChatEvents } from "../hooks/useChatEvents.js";
-import { useChatScroll } from "../hooks/useChatScroll.js";
+import { useChatEvents } from "../hooks/chat/useChatEvents.js";
+import { useChatScroll } from "../hooks/chat/useChatScroll.js";
+import { useChatCacheStats } from "../hooks/chat/useChatCacheStats.js";
+import { useChatNotifications } from "../hooks/chat/useChatNotifications.js";
+import { useDiscoverSearch } from "../hooks/chat/useDiscoverSearch.js";
+import { useActiveChatState } from "../hooks/chat/useActiveChatState.js";
+import { useAppActivity } from "../hooks/chat/useAppActivity.js";
+import { useDmUsernames } from "../hooks/chat/useDmUsernames.js";
+import { useHealthCheck } from "../hooks/chat/useHealthCheck.js";
+import { useMessagesLoader } from "../hooks/chat/useMessagesLoader.js";
+import { useMobileViewport } from "../hooks/chat/useMobileViewport.js";
+import { useNewChatSearch } from "../hooks/chat/useNewChatSearch.js";
+import { useNewGroupModal } from "../hooks/chat/useNewGroupModal.js";
+import { usePerfTelemetry } from "../hooks/chat/usePerfTelemetry.js";
+import { useResumeRefresh } from "../hooks/chat/useResumeRefresh.js";
+import { useAppReleaseInfo } from "../hooks/useAppReleaseInfo.js";
 import { Bookmark } from "../icons/lucide.js";
+import { CLIPBOARD_COPY_EVENT } from "../utils/clipboard.js";
+import { CACHE_STORES } from "../utils/cacheDb.js";
+import { downloadMessageFiles } from "../utils/fileDownload.js";
 import {
-  CACHE_STORES,
-  idbClearStore,
-  idbDelete,
-  idbGet,
-  idbGetAllEntries,
-  idbGetStats,
-  idbSet,
-  isIdbAvailable,
-} from "../utils/cacheDb.js";
+  CHAT_CACHE_VERSION,
+  buildChatListCacheKey,
+  buildMessagesCacheKey,
+  canUseIdb,
+  deleteIdbCache,
+  normalizeMessageBody,
+  normalizeMessagesForRender,
+  pruneMessagesIndex,
+  readChatListCacheAsync,
+  readMessagesCacheAsync,
+  readMessagesIndexAsync,
+  sanitizeMessagesForCache,
+  readChannelSeenCacheAsync,
+  writeChannelSeenCacheAsync,
+  writeIdbCache,
+  migrateLocalCacheToIdb,
+  updateMessagesIndex,
+  writeMessagesIndex,
+} from "../utils/chatCache.js";
+import { getMessageFiles } from "../utils/messageContent.js";
 import {
   createDmChat,
   discoverUsersAndGroups,
   createChannelChat,
   createGroupChat,
+  deleteMessage,
   deleteAccount,
   deleteGroupChat,
+  editMessage,
   fetchHealth,
   fetchPresence,
+  getChatPreview,
   getGroupInviteLink,
   getMessagesUploadUrl,
   getSseStreamUrl,
@@ -53,6 +79,7 @@ import {
   markMessagesRead,
   pingPresence,
   searchUsers,
+  sendTypingIndicator,
   sendMessage,
   removeGroupMember,
   regenerateGroupInviteLink,
@@ -63,6 +90,7 @@ import {
   uploadGroupAvatar,
   getSavedMessagesChat,
   fetchPushPublicKey,
+  forwardMessage,
   subscribePush,
   unsubscribePush,
   sendPushTest,
@@ -72,420 +100,172 @@ import {
   uploadAvatar,
 } from "../api/chatApi.js";
 import { APP_CONFIG } from "../settings/appConfig.js";
+import {
+  MOBILE_CLOSE_ANIMATION_MS,
+  NEW_CHAT_SEARCH_DEBOUNCE_MS,
+  NOTIFICATION_PREVIEW_MAX_CHARS,
+  OPEN_CHAT_ID_KEY,
+  PRESENCE_IDLE_THRESHOLD_MS,
+  UPLOAD_PROGRESS_HIDE_DELAY_MS,
+} from "../utils/chatPageConstants.js";
 
-const NEW_CHAT_SEARCH_DEBOUNCE_MS = 300;
-const MOBILE_CLOSE_ANIMATION_MS = 340;
-const UPLOAD_PROGRESS_HIDE_DELAY_MS = 600;
-const NOTIFICATION_PREVIEW_MAX_CHARS = 120;
-const NOTIFICATIONS_ENABLED_KEY = "songbird-notify-enabled";
-const OPEN_CHAT_ID_KEY = "songbird-open-chat-id";
-const PRESENCE_IDLE_THRESHOLD_MS = 12 * 1000;
-const CHAT_CACHE_VERSION = 2;
-const CHAT_LIST_CACHE_KEY = "songbird-chat-list-cache";
-const CHAT_MESSAGES_CACHE_KEY = "songbird-chat-messages-cache";
-const CHAT_MESSAGES_INDEX_KEY = "songbird-chat-messages-index";
-const CHAT_MESSAGES_INDEX_LIMIT = 25;
-const MEDIA_THUMB_CACHE_KEY = "chat-media-thumbs-v2";
-const MEDIA_POSTER_CACHE_KEY = "chat-video-posters-v3";
-const VOICE_WAVEFORM_CACHE_KEY = "voice-waveform-cache-v1";
-const CHANNEL_SEEN_CACHE_KEY = "songbird-channel-seen";
-const MESSAGE_CACHE_MAX = Math.max(
-  50,
-  Math.min(200, CHAT_PAGE_CONFIG.messageFetchLimit),
-);
+const loadChatProfileModal = () => import("../components/modals/ChatProfileModal.jsx");
+const loadDeleteChatsModal = () => import("../components/modals/DeleteChatsModal.jsx");
+const loadDeleteMessageScopeModal = () =>
+  import("../components/modals/DeleteMessageScopeModal.jsx");
+const loadForwardMessageModal = () =>
+  import("../components/modals/ForwardMessageModal.jsx");
+const loadLeaveGroupModal = () => import("../components/modals/LeaveGroupModal.jsx");
+const loadGroupInviteLinkModal = () => import("../components/modals/GroupInviteLinkModal.jsx");
+const loadNewChatModal = () => import("../components/modals/NewChatModal.jsx");
+const loadNewGroupModal = () => import("../components/modals/NewGroupModal.jsx");
+const loadDesktopSettingsModal = () =>
+  import("../components/settings/modals/DesktopSettingsModal.jsx").then((mod) => ({
+    default: mod.DesktopSettingsModal,
+  }));
+const loadNotificationsSettingsModal = () =>
+  import("../components/settings/modals/NotificationsSettingsModal.jsx").then((mod) => ({
+    default: mod.NotificationsSettingsModal,
+  }));
+const loadWhatsNewModal = () => import("../components/modals/WhatsNewModal.jsx");
 
-const safeParseJson = (raw) => {
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+const ChatProfileModal = lazy(loadChatProfileModal);
+const DeleteChatsModal = lazy(loadDeleteChatsModal);
+const DeleteMessageScopeModal = lazy(loadDeleteMessageScopeModal);
+const ForwardMessageModal = lazy(loadForwardMessageModal);
+const LeaveGroupModal = lazy(loadLeaveGroupModal);
+const GroupInviteLinkModal = lazy(loadGroupInviteLinkModal);
+const NewChatModal = lazy(loadNewChatModal);
+const NewGroupModal = lazy(loadNewGroupModal);
+const DesktopSettingsModal = lazy(loadDesktopSettingsModal);
+const NotificationsSettingsModal = lazy(loadNotificationsSettingsModal);
+const WhatsNewModal = lazy(loadWhatsNewModal);
+
+const preloadChatPageCriticalChunks = () =>
+  Promise.allSettled([
+    loadNewChatModal(),
+    loadDesktopSettingsModal(),
+    loadNotificationsSettingsModal(),
+    loadWhatsNewModal(),
+  ]);
+
+const preloadChatPageLazyChunks = () =>
+  Promise.allSettled([
+    loadChatProfileModal(),
+    loadDeleteChatsModal(),
+    loadDeleteMessageScopeModal(),
+    loadForwardMessageModal(),
+    loadLeaveGroupModal(),
+    loadGroupInviteLinkModal(),
+    loadNewChatModal(),
+    loadNewGroupModal(),
+    loadDesktopSettingsModal(),
+    loadNotificationsSettingsModal(),
+    loadWhatsNewModal(),
+  ]);
+
+const resolveChunkPreloadMode = () => {
+  if (typeof navigator === "undefined") return "eager";
+  const connection =
+    navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!connection) return "eager";
+  if (connection.saveData) return "idle";
+  const effectiveType = String(connection.effectiveType || "").toLowerCase();
+  if (effectiveType === "slow-2g" || effectiveType === "2g") return "idle";
+  return "eager";
 };
 
-const normalizeMessageBody = (value) => {
-  if (typeof value === "string") {
-    return value === "[object Object]" ? "" : value;
-  }
-  if (value && typeof value === "object") {
-    const text = value.text ?? value.body;
-    return typeof text === "string" ? text : "";
-  }
-  if (value === null || value === undefined) return "";
-  const str = String(value);
-  if (str === "[object Object]") return "";
-  return str;
+const IN_MEMORY_MESSAGES_CACHE_MAX_CHATS = 8;
+const IN_MEMORY_MESSAGES_PER_CHAT = 480;
+const IN_MEMORY_MESSAGES_CACHE_STALE_MS = 20 * 60 * 1000;
+
+const pruneMessagesForMemory = (messages) => {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length <= IN_MEMORY_MESSAGES_PER_CHAT) return list;
+  return list.slice(-IN_MEMORY_MESSAGES_PER_CHAT);
 };
 
-let localStorageAvailable;
-const canUseLocalStorage = () => {
-  if (typeof window === "undefined") return false;
-  if (localStorageAvailable !== undefined) return localStorageAvailable;
-  try {
-    const testKey = "__songbird_ls_test__";
-    window.localStorage.setItem(testKey, "1");
-    window.localStorage.removeItem(testKey);
-    localStorageAvailable = true;
-  } catch {
-    localStorageAvailable = false;
-  }
-  return localStorageAvailable;
-};
-
-let idbAvailable;
-const canUseIdb = () => {
-  if (typeof window === "undefined") return false;
-  if (idbAvailable !== undefined) return idbAvailable;
-  idbAvailable = isIdbAvailable();
-  return idbAvailable;
-};
-
-const readLocalCache = (key) => {
-  if (typeof window === "undefined") return null;
-  if (!canUseLocalStorage()) return null;
-  return safeParseJson(window.localStorage.getItem(key));
-};
-
-const removeLocalCache = (key) => {
-  if (typeof window === "undefined") return;
-  if (!canUseLocalStorage()) return;
-  try {
-    window.localStorage.removeItem(key);
-  } catch {
-    // ignore storage failures
-  }
-};
-
-const writeLocalCache = (key, value) => {
-  if (typeof window === "undefined") return false;
-  if (!canUseLocalStorage()) return false;
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const readIdbCache = async (store, key) => {
-  if (!canUseIdb()) return null;
-  const entry = await idbGet(store, key);
-  return entry?.data ?? null;
-};
-
-const writeIdbCache = async (store, key, value) => {
-  if (!canUseIdb()) return false;
-  const ok = await idbSet(store, key, value);
-  return Boolean(ok);
-};
-
-const deleteIdbCache = async (store, key) => {
-  if (!canUseIdb()) return false;
-  await idbDelete(store, key);
-  return true;
-};
-
-const buildChatListCacheKey = (username) =>
-  `${CHAT_LIST_CACHE_KEY}:${String(username || "").toLowerCase()}`;
-
-const buildMessagesCacheKey = (username, chatId) =>
-  `${CHAT_MESSAGES_CACHE_KEY}:${String(username || "").toLowerCase()}:${Number(chatId || 0)}`;
-
-const buildMessagesIndexKey = (username) =>
-  `${CHAT_MESSAGES_INDEX_KEY}:${String(username || "").toLowerCase()}`;
-
-const buildChannelSeenCacheKey = (username, chatId) =>
-  `${CHANNEL_SEEN_CACHE_KEY}:${String(username || "").toLowerCase()}:${Number(chatId || 0)}`;
-
-const isCacheExpired = (entry, ttlMs) => {
-  if (!entry || typeof entry !== "object") return true;
-  if (!Number.isFinite(Number(entry.updatedAt))) return true;
-  return Date.now() - Number(entry.updatedAt) > ttlMs;
-};
-
-const readChatListCache = (username) => {
-  const cached = readLocalCache(buildChatListCacheKey(username));
-  if (!cached || cached.version !== CHAT_CACHE_VERSION) return null;
-  if (isCacheExpired(cached, CHAT_PAGE_CONFIG.cacheTtlMs)) {
-    removeLocalCache(buildChatListCacheKey(username));
-    return null;
-  }
-  return cached;
-};
-
-const readChatListCacheAsync = async (username) => {
-  const cached = await readIdbCache(
-    CACHE_STORES.chatList,
-    buildChatListCacheKey(username),
-  );
-  if (!cached || cached.version !== CHAT_CACHE_VERSION) return null;
-  if (isCacheExpired(cached, CHAT_PAGE_CONFIG.cacheTtlMs)) {
-    await deleteIdbCache(CACHE_STORES.chatList, buildChatListCacheKey(username));
-    return null;
-  }
-  return cached;
-};
-
-const readMessagesCache = (username, chatId) => {
-  const key = buildMessagesCacheKey(username, chatId);
-  const cached = readLocalCache(key);
-  if (!cached || cached.version !== CHAT_CACHE_VERSION) return null;
-  if (isCacheExpired(cached, CHAT_PAGE_CONFIG.cacheTtlMs)) {
-    removeLocalCache(key);
-    return null;
-  }
-  if (Array.isArray(cached.messages)) {
-    cached.messages = cached.messages.filter((msg) => {
-      const id = Number(msg?.id || msg?._serverId || 0);
-      return Number.isFinite(id) && id > 0;
-    });
-  }
-  return cached;
-};
-
-const readMessagesCacheAsync = async (username, chatId) => {
-  const key = buildMessagesCacheKey(username, chatId);
-  const cached = await readIdbCache(CACHE_STORES.messages, key);
-  if (!cached || cached.version !== CHAT_CACHE_VERSION) return null;
-  if (isCacheExpired(cached, CHAT_PAGE_CONFIG.cacheTtlMs)) {
-    await deleteIdbCache(CACHE_STORES.messages, key);
-    return null;
-  }
-  if (Array.isArray(cached.messages)) {
-    cached.messages = cached.messages.filter((msg) => {
-      const id = Number(msg?.id || msg?._serverId || 0);
-      return Number.isFinite(id) && id > 0;
-    });
-  }
-  return cached;
-};
-
-const readMessagesIndex = (username) => {
-  const index = readLocalCache(buildMessagesIndexKey(username));
-  return Array.isArray(index) ? index : [];
-};
-
-const readMessagesIndexAsync = async (username) => {
-  const cached = await readIdbCache(CACHE_STORES.index, buildMessagesIndexKey(username));
-  return Array.isArray(cached) ? cached : [];
-};
-
-const readChannelSeenCache = (username, chatId) => {
-  const cached = readLocalCache(buildChannelSeenCacheKey(username, chatId));
-  if (!cached || typeof cached !== "object") return {};
-  if (cached.version !== 1 || typeof cached.counts !== "object") return {};
-  return cached.counts || {};
-};
-
-const writeChannelSeenCache = (username, chatId, counts = {}) => {
-  if (!username || !chatId || typeof counts !== "object") return;
-  const entries = Object.entries(counts)
-    .map(([key, value]) => [Number(key), Number(value)])
-    .filter(([id, value]) => Number.isFinite(id) && id > 0 && Number.isFinite(value));
-  if (!entries.length) return;
-  entries.sort((a, b) => b[0] - a[0]);
-  const trimmed = entries.slice(0, 300).reduce((acc, [id, value]) => {
-    acc[id] = value;
-    return acc;
-  }, {});
-  writeLocalCache(buildChannelSeenCacheKey(username, chatId), {
-    version: 1,
-    updatedAt: Date.now(),
-    counts: trimmed,
-  });
-};
-
-const writeMessagesIndex = (username, index) => {
-  writeLocalCache(buildMessagesIndexKey(username), index);
-  void writeIdbCache(CACHE_STORES.index, buildMessagesIndexKey(username), index);
-};
-
-const pruneMessagesIndex = (username, index) => {
-  const trimmed = index
-    .filter((entry) => Number(entry?.chatId) > 0 && Number.isFinite(Number(entry?.updatedAt)))
-    .sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
-    .slice(0, CHAT_MESSAGES_INDEX_LIMIT);
-  const keepIds = new Set(trimmed.map((entry) => Number(entry.chatId)));
-  index.forEach((entry) => {
-    const chatId = Number(entry?.chatId);
-    if (!chatId || keepIds.has(chatId)) return;
-    removeLocalCache(buildMessagesCacheKey(username, chatId));
-    void deleteIdbCache(CACHE_STORES.messages, buildMessagesCacheKey(username, chatId));
-  });
-  return trimmed;
-};
-
-const updateMessagesIndex = (username, chatId, updatedAt) => {
-  if (!username || !chatId) return;
-  const index = readMessagesIndex(username);
-  const next = index.filter((entry) => Number(entry?.chatId) !== Number(chatId));
-  next.push({ chatId: Number(chatId), updatedAt: Number(updatedAt) || Date.now() });
-  const trimmed = pruneMessagesIndex(username, next);
-  writeMessagesIndex(username, trimmed);
-};
-
-const evictOldestMessageCaches = (username, maxToRemove = 3) => {
-  if (!username) return;
-  const index = readMessagesIndex(username);
-  if (!index.length) return;
-  const sorted = index
-    .filter((entry) => Number(entry?.chatId) > 0)
-    .sort((a, b) => Number(a.updatedAt || 0) - Number(b.updatedAt || 0));
-  const toRemove = sorted.slice(0, maxToRemove);
-  if (!toRemove.length) return;
-  const removeIds = new Set(toRemove.map((entry) => Number(entry.chatId)));
-  removeIds.forEach((chatId) => {
-    removeLocalCache(buildMessagesCacheKey(username, chatId));
-    void deleteIdbCache(CACHE_STORES.messages, buildMessagesCacheKey(username, chatId));
-  });
-  const remaining = index.filter((entry) => !removeIds.has(Number(entry?.chatId)));
-  writeMessagesIndex(username, remaining);
-};
-
-const isCacheableMessage = (message) => {
-  if (!message || typeof message !== "object") return false;
-  const id = Number(message.id || message._serverId || 0);
-  if (!Number.isFinite(id) || id <= 0) return false;
-  if (message._delivery === "sending") return false;
-  if (message._awaitingServerEcho) return false;
-  if (message._processingPending) return false;
-  if (Array.isArray(message.files)) {
-    const hasLocalBlob = message.files.some((file) =>
-      String(file?.url || file?._localUrl || "").startsWith("blob:"),
-    );
-    if (hasLocalBlob) return false;
-  }
-  return true;
-};
-
-const sanitizeMessageForCache = (message) => {
-  if (!message || typeof message !== "object") return message;
-  const normalizedBody = normalizeMessageBody(message.body);
-  const normalizedReply =
-    message.replyTo && typeof message.replyTo === "object"
-      ? {
-          ...message.replyTo,
-          body: normalizeMessageBody(message.replyTo.body),
-        }
-      : message.replyTo || null;
-  const { _files, ...rest } = message;
-  rest.body = normalizedBody;
-  if (normalizedReply) {
-    rest.replyTo = normalizedReply;
-  }
-  if (Array.isArray(rest.files)) {
-    rest.files = rest.files.map((file) => {
-      if (!file || typeof file !== "object") return file;
-      const {
-        file: _file,
-        _localUrl,
-        _localId,
-        _uploadProgress,
-        _pending,
-        ...fileRest
-      } = file;
-      if (String(fileRest.url || "").startsWith("blob:")) {
-        fileRest.url = "";
-      }
-      return fileRest;
-    });
-  }
-  return rest;
-};
-
-const sanitizeMessagesForCache = (messages) =>
-  (Array.isArray(messages) ? messages : [])
-    .filter(isCacheableMessage)
-    .map(sanitizeMessageForCache)
-    .slice(-MESSAGE_CACHE_MAX);
-
-const normalizeMessageForRender = (message) => {
-  if (!message || typeof message !== "object") return message;
-  let normalizedBody = normalizeMessageBody(message.body);
-  const files = Array.isArray(message.files) ? message.files : [];
-  const hasAudio = files.some((file) =>
-    String(file?.mimeType || "").toLowerCase().startsWith("audio/"),
-  );
-  if (hasAudio) {
-    const genericBodyPattern =
-      /^Sent (a media file|a document|a file|\d+ files|\d+ media files)$/i;
-    if (!normalizedBody || genericBodyPattern.test(normalizedBody)) {
-      normalizedBody = "Sent a voice message";
-    }
-  }
-  const normalizedReply =
-    message.replyTo && typeof message.replyTo === "object"
-      ? {
-          ...message.replyTo,
-          body: normalizeMessageBody(message.replyTo.body),
-        }
-      : message.replyTo || null;
+const normalizeMessagesCachePayloadForMemory = (payload) => {
+  if (!payload || !Array.isArray(payload.messages)) return payload;
+  const trimmedMessages = pruneMessagesForMemory(payload.messages);
+  if (trimmedMessages === payload.messages) return payload;
+  const nextLastMessageId = trimmedMessages.length
+    ? Number(trimmedMessages[trimmedMessages.length - 1]?.id || 0)
+    : 0;
   return {
-    ...message,
-    body: normalizedBody,
-    replyTo: normalizedReply,
+    ...payload,
+    messages: trimmedMessages,
+    hasOlderMessages: true,
+    lastMessageId: nextLastMessageId,
+    updatedAt: Date.now(),
   };
 };
 
-const normalizeMessagesForRender = (messages) =>
-  (Array.isArray(messages) ? messages : []).map(normalizeMessageForRender);
+const readMessagesCacheMemory = (cacheMap, chatId) => {
+  const numericChatId = Number(chatId || 0);
+  if (!numericChatId || !cacheMap?.has(numericChatId)) return null;
+  const value = cacheMap.get(numericChatId);
+  cacheMap.delete(numericChatId);
+  cacheMap.set(numericChatId, value);
+  return value;
+};
 
+const pruneMessagesCacheMemory = (cacheMap, activeChatId = null) => {
+  if (!cacheMap || !cacheMap.size) return;
+  const activeId = Number(activeChatId || 0);
+  const now = Date.now();
+  const staleKeys = [];
+  cacheMap.forEach((value, key) => {
+    const updatedAt = Number(value?.updatedAt || 0);
+    if (!updatedAt) return;
+    if (activeId && Number(key) === activeId) return;
+    if (now - updatedAt > IN_MEMORY_MESSAGES_CACHE_STALE_MS) {
+      staleKeys.push(key);
+    }
+  });
+  staleKeys.forEach((key) => cacheMap.delete(key));
+  while (cacheMap.size > IN_MEMORY_MESSAGES_CACHE_MAX_CHATS) {
+    const oldestKey = cacheMap.keys().next().value;
+    if (oldestKey === undefined) break;
+    if (activeId && Number(oldestKey) === activeId && cacheMap.size > 1) {
+      const activeValue = cacheMap.get(oldestKey);
+      cacheMap.delete(oldestKey);
+      cacheMap.set(oldestKey, activeValue);
+      continue;
+    }
+    cacheMap.delete(oldestKey);
+  }
+};
 
+const writeMessagesCacheMemory = (cacheMap, chatId, payload, activeChatId = null) => {
+  const numericChatId = Number(chatId || 0);
+  if (!numericChatId || !payload || !cacheMap) return;
+  const normalized = normalizeMessagesCachePayloadForMemory(payload);
+  cacheMap.set(numericChatId, normalized);
+  if (cacheMap.size > 1) {
+    const current = cacheMap.get(numericChatId);
+    cacheMap.delete(numericChatId);
+    cacheMap.set(numericChatId, current);
+  }
+  pruneMessagesCacheMemory(cacheMap, activeChatId || numericChatId);
+};
 
+ 
 
 export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme }) {
+  /* eslint-disable react-hooks/exhaustive-deps */
   const [profileError, setProfileError] = useState("");
   const [passwordError, setPasswordError] = useState("");
-  const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingChats, setLoadingChats] = useState(true);
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [channelSeenCounts, setChannelSeenCounts] = useState({});
-  const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [mobileTab, setMobileTab] = useState("chats");
   const [settingsPanel, setSettingsPanel] = useState(null);
-  const [notificationsModalOpen, setNotificationsModalOpen] = useState(false);
-  const [testNotificationSent, setTestNotificationSent] = useState(false);
-  const [pushSwReady, setPushSwReady] = useState(false);
-  const [pushVapidReady, setPushVapidReady] = useState(null);
-  const [pushVapidLength, setPushVapidLength] = useState(null);
-  const [pushSubscribeStatus, setPushSubscribeStatus] = useState(null);
-  const [pushSubscribeError, setPushSubscribeError] = useState("");
-  const [newChatOpen, setNewChatOpen] = useState(false);
-  const [newChatUsername, setNewChatUsername] = useState("");
-  const [newChatError, setNewChatError] = useState("");
-  const [newChatResults, setNewChatResults] = useState([]);
-  const [newChatLoading, setNewChatLoading] = useState(false);
-  const [newChatSelection, setNewChatSelection] = useState(null);
-  const dmUsernamesRef = useRef(new Set());
-  const [chatsSearchQuery, setChatsSearchQuery] = useState("");
   const [chatsSearchFocused, setChatsSearchFocused] = useState(false);
-  const [discoverLoading, setDiscoverLoading] = useState(false);
-  const [discoverUsers, setDiscoverUsers] = useState([]);
-  const [discoverGroups, setDiscoverGroups] = useState([]);
-  const [discoverChannels, setDiscoverChannels] = useState([]);
-  const [discoverSaved, setDiscoverSaved] = useState(false);
-  const [newGroupOpen, setNewGroupOpen] = useState(false);
-  const [creatingGroup, setCreatingGroup] = useState(false);
-  const [groupModalType, setGroupModalType] = useState("group");
-  const [newGroupForm, setNewGroupForm] = useState({
-    nickname: "",
-    username: "",
-    visibility: "public",
-    allowMemberInvites: true,
-  });
-  const [newGroupSearch, setNewGroupSearch] = useState("");
-  const [newGroupSearchResults, setNewGroupSearchResults] = useState([]);
-  const [newGroupSearchLoading, setNewGroupSearchLoading] = useState(false);
-  const [newGroupMembers, setNewGroupMembers] = useState([]);
-  const [newGroupError, setNewGroupError] = useState("");
-  const [groupInviteOpen, setGroupInviteOpen] = useState(false);
-  const [createdGroupInviteLink, setCreatedGroupInviteLink] = useState("");
-  const [editGroupInviteLink, setEditGroupInviteLink] = useState("");
-  const [regeneratingGroupInviteLink, setRegeneratingGroupInviteLink] = useState(false);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [profileModalMember, setProfileModalMember] = useState(null);
   const [profileInviteLink, setProfileInviteLink] = useState("");
@@ -496,6 +276,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const [selectedChats, setSelectedChats] = useState([]);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [pendingDeleteIds, setPendingDeleteIds] = useState([]);
+  const [confirmLeaveOpen, setConfirmLeaveOpen] = useState(false);
+  const [pendingLeaveChatId, setPendingLeaveChatId] = useState(null);
   const [, setIsAtBottom] = useState(true);
   const [userScrolledUp, setUserScrolledUp] = useState(false);
   const [unreadInChat, setUnreadInChat] = useState(0);
@@ -506,7 +288,16 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const [uploadError, setUploadError] = useState("");
   const [activeUploadProgress, setActiveUploadProgress] = useState(null);
   const [replyTarget, setReplyTarget] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
+  const [messageDeleteScopeOpen, setMessageDeleteScopeOpen] = useState(false);
+  const [pendingDeleteMessage, setPendingDeleteMessage] = useState(null);
+  const [forwardMessageTarget, setForwardMessageTarget] = useState(null);
+  const [forwardSavedChat, setForwardSavedChat] = useState(null);
+  const [copyToastVisible, setCopyToastVisible] = useState(false);
+  const updateToastTimerRef = useRef(null);
+  const copyToastTimerRef = useRef(null);
   const chatScrollRef = useRef(null);
+  const composerInputRef = useRef(null);
   const lastMessageIdRef = useRef(null);
   const isAtBottomRef = useRef(true);
   const userScrolledUpRef = useRef(false);
@@ -521,13 +312,12 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const suppressScrolledUpRef = useRef(false);
   const shouldAutoMarkReadRef = useRef(true);
   const openingChatRef = useRef(false);
+  const smoothScrollLockRef = useRef(0);
   const pendingUploadFilesRef = useRef([]);
   const pendingVoiceMessageRef = useRef(null);
   const prevUploadProgressRef = useRef(null);
   const mediaLoadSnapTimerRef = useRef(null);
   const messageRefreshTimerRef = useRef(null);
-  const messageFetchInFlightRef = useRef(false);
-  const queuedSilentMessageRefreshRef = useRef(null);
   const channelSeenQueueRef = useRef([]);
   const channelSeenActiveRef = useRef(false);
   const channelSeenLoadedRef = useRef(new Set());
@@ -535,41 +325,358 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const channelSeenLatestRefreshRef = useRef(0);
   const messagesCacheRef = useRef(new Map());
   const messagesCacheWriteTimerRef = useRef(null);
+  const messageBlobUrlsRef = useRef(new Set());
   const [sseConnected, setSseConnected] = useState(false);
-  const [dataCacheStats, setDataCacheStats] = useState({
-    totalBytes: 0,
-    totalLabel: "0 B",
-    chatList: {
-      count: 0,
-      sizeBytes: 0,
-      sizeLabel: "0 B",
-      updatedAt: null,
-      entries: [],
+  const lazyChunksPreloadedRef = useRef(false);
+
+  useEffect(() => {
+    setReplyTarget(null);
+    setEditTarget(null);
+    setMessageDeleteScopeOpen(false);
+    setPendingDeleteMessage(null);
+    setForwardMessageTarget(null);
+    setForwardSavedChat(null);
+  }, [activeChatId]);
+
+  useEffect(() => {
+    if (lazyChunksPreloadedRef.current) return;
+    let cancelled = false;
+    let idleId = null;
+    let criticalTimerId = null;
+    let timerId = null;
+    const mode = resolveChunkPreloadMode();
+    const eagerNetwork = mode === "eager";
+
+    const warmCritical = () => {
+      if (cancelled) return;
+      void preloadChatPageCriticalChunks();
+    };
+
+    const warm = () => {
+      if (cancelled) return;
+      if (lazyChunksPreloadedRef.current) return;
+      lazyChunksPreloadedRef.current = true;
+      void preloadChatPageLazyChunks();
+    };
+    const handleFirstIntent = () => {
+      warm();
+    };
+    window.addEventListener("pointerdown", handleFirstIntent, {
+      once: true,
+      passive: true,
+      capture: true,
+    });
+    window.addEventListener("keydown", handleFirstIntent, {
+      once: true,
+      passive: true,
+      capture: true,
+    });
+
+    criticalTimerId = window.setTimeout(warmCritical, eagerNetwork ? 90 : 240);
+    if (eagerNetwork) {
+      timerId = window.setTimeout(warm, 120);
+    } else if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
+      idleId = window.requestIdleCallback(warm, { timeout: 1500 });
+    } else {
+      timerId = window.setTimeout(warm, 900);
+    }
+    return () => {
+      cancelled = true;
+      window.removeEventListener("pointerdown", handleFirstIntent, {
+        capture: true,
+      });
+      window.removeEventListener("keydown", handleFirstIntent, {
+        capture: true,
+      });
+      if (
+        idleId !== null &&
+        typeof window !== "undefined" &&
+        typeof window.cancelIdleCallback === "function"
+      ) {
+        window.cancelIdleCallback(idleId);
+      }
+      if (timerId !== null && typeof window !== "undefined") {
+        window.clearTimeout(timerId);
+      }
+      if (criticalTimerId !== null && typeof window !== "undefined") {
+        window.clearTimeout(criticalTimerId);
+      }
+    };
+  }, []);
+
+  const { dataCacheStats, handleClearCache } = useChatCacheStats({
+    user,
+    settingsPanel,
+    messagesCacheRef,
+  });
+  const {
+    appInfo,
+    appInfoLoading,
+    appInfoError,
+    whatsNewOpen,
+    openWhatsNew,
+    dismissWhatsNew,
+  } = useAppReleaseInfo();
+  const { isAppActive } = useAppActivity();
+  const { isMobileViewport } = useMobileViewport();
+  const { isConnected } = useHealthCheck({
+    fetchHealth,
+    intervalMs: CHAT_PAGE_CONFIG.healthCheckIntervalMs,
+  });
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    const hasTopLayerModal = Boolean(
+      profileModalOpen || (settingsPanel && mobileTab !== "settings"),
+    );
+    if (hasTopLayerModal) {
+      root.style.setProperty("--app-z", "90");
+    } else if (isMobileViewport && activeChatId) {
+      root.style.setProperty("--app-z", "40");
+    } else {
+      root.style.setProperty("--app-z", "20");
+    }
+    return () => {
+      root.style.setProperty("--app-z", "20");
+    };
+  }, [activeChatId, isMobileViewport, mobileTab, profileModalOpen, settingsPanel]);
+
+  const { dmUsernamesRef } = useDmUsernames({ chats, user });
+  const {
+    notificationsModalOpen,
+    setNotificationsModalOpen,
+    testNotificationSent,
+    notificationsEnabled,
+    notificationPermission,
+    notificationsSupported,
+    notificationsActive,
+    notificationsDisabled,
+    notificationStatusLabel,
+    notificationsDebugLine,
+    handleToggleNotifications,
+    handleTestPush,
+  } = useChatNotifications({
+    user,
+    settingsPanel,
+    fetchPushPublicKey,
+    subscribePush,
+    unsubscribePush,
+    sendPushTest,
+  });
+
+  useEffect(() => {
+    if (typeof navigator === "undefined") return;
+    if (!("serviceWorker" in navigator)) return;
+    const handleSwMessage = (event) => {
+      if (event?.data?.type !== "APP_SHELL_UPDATED") return;
+      setIsUpdatingChats(true);
+      if (updateToastTimerRef.current) {
+        window.clearTimeout(updateToastTimerRef.current);
+      }
+      updateToastTimerRef.current = window.setTimeout(() => {
+        setIsUpdatingChats(false);
+      }, 2000);
+    };
+    navigator.serviceWorker.addEventListener("message", handleSwMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener("message", handleSwMessage);
+      if (updateToastTimerRef.current) {
+        window.clearTimeout(updateToastTimerRef.current);
+      }
+    };
+  }, []);
+
+  const showCopiedToast = useCallback(() => {
+    setCopyToastVisible(true);
+    if (copyToastTimerRef.current) {
+      window.clearTimeout(copyToastTimerRef.current);
+    }
+    copyToastTimerRef.current = window.setTimeout(() => {
+      setCopyToastVisible(false);
+    }, 1400);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleClipboardCopy = () => {
+      showCopiedToast();
+    };
+    window.addEventListener(CLIPBOARD_COPY_EVENT, handleClipboardCopy);
+    return () => {
+      window.removeEventListener(CLIPBOARD_COPY_EVENT, handleClipboardCopy);
+      if (copyToastTimerRef.current) {
+        window.clearTimeout(copyToastTimerRef.current);
+      }
+    };
+  }, [showCopiedToast]);
+
+  useEffect(() => {
+    if (!isMobileViewport) return;
+    if (activeChatId) {
+      window.dispatchEvent(new Event("songbird-hide-install-bar"));
+    } else {
+      window.dispatchEvent(new Event("songbird-show-install-bar"));
+    }
+  }, [activeChatId, isMobileViewport]);
+  const [microphonePermission, setMicrophonePermission] = useState("unknown");
+  const [microphonePermissionSupported, setMicrophonePermissionSupported] =
+    useState(false);
+  const [permissionPromptDelayUntil, setPermissionPromptDelayUntil] = useState(0);
+  const PERMISSION_DISMISS_PREFIX = "songbird-permission-dismiss-";
+  const PERMISSION_DISMISS_MS = 3 * 24 * 60 * 60 * 1000;
+  const PERMISSION_PROMPT_DELAY_MS = 1000;
+  const readPermissionDismissed = (kind) => {
+    if (typeof window === "undefined") return false;
+    const key = `${PERMISSION_DISMISS_PREFIX}${kind}`;
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return false;
+    const until = Number(raw);
+    if (!Number.isFinite(until) || until <= Date.now()) {
+      window.localStorage.removeItem(key);
+      return false;
+    }
+    return true;
+  };
+  const [permissionsDismissed, setPermissionsDismissed] = useState(() => ({
+    notification: readPermissionDismissed("notification"),
+    microphone: readPermissionDismissed("microphone"),
+  }));
+  const requestMicrophonePermission = useCallback(async () => {
+    if (typeof navigator === "undefined") return;
+    if (!navigator.mediaDevices?.getUserMedia) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream?.getTracks?.().forEach((track) => track.stop());
+      setMicrophonePermission("granted");
+    } catch (err) {
+      const message = String(err?.name || err?.message || "");
+      if (message.toLowerCase().includes("notallowed")) {
+        setMicrophonePermission("denied");
+      }
+    }
+  }, []);
+  const dismissPermissionsPrompt = useCallback(
+    (mode) => {
+      if (typeof window === "undefined") return;
+      const kind = mode || "notification";
+      const key = `${PERMISSION_DISMISS_PREFIX}${kind}`;
+      const until = Date.now() + PERMISSION_DISMISS_MS;
+      window.localStorage.setItem(key, String(until));
+      setPermissionsDismissed((prev) => ({ ...prev, [kind]: true }));
+      setPermissionPromptDelayUntil(Date.now() + PERMISSION_PROMPT_DELAY_MS);
     },
-    messageCaches: {
-      count: 0,
-      sizeBytes: 0,
-      sizeLabel: "0 B",
-      entries: [],
-    },
-    mediaThumbs: {
-      count: 0,
-      sizeBytes: 0,
-      sizeLabel: "0 B",
-      updatedAt: null,
-    },
-    mediaPosters: {
-      count: 0,
-      sizeBytes: 0,
-      sizeLabel: "0 B",
-      updatedAt: null,
-    },
-    voiceWaveforms: {
-      count: 0,
-      sizeBytes: 0,
-      sizeLabel: "0 B",
-      updatedAt: null,
-    },
+    [PERMISSION_DISMISS_MS, PERMISSION_PROMPT_DELAY_MS],
+  );
+  const requestNotificationsPermission = useCallback(async () => {
+    if (notificationPermission !== "default") return;
+    await handleToggleNotifications();
+  }, [handleToggleNotifications, notificationPermission]);
+
+  useEffect(() => {
+    if (typeof navigator === "undefined") return;
+    let active = true;
+    let permissionStatus = null;
+    const handlePermissionChange = () => {
+      if (!active || !permissionStatus) return;
+      setMicrophonePermission(permissionStatus.state || "prompt");
+    };
+    const refresh = async () => {
+      const supported = Boolean(navigator.mediaDevices?.getUserMedia);
+      if (!active) return;
+      setMicrophonePermissionSupported(supported);
+      if (!supported) {
+        setMicrophonePermission("unsupported");
+        return;
+      }
+      if (!navigator.permissions?.query) {
+        setMicrophonePermission("prompt");
+        return;
+      }
+      try {
+        permissionStatus = await navigator.permissions.query({
+          name: "microphone",
+        });
+        if (!active) return;
+        setMicrophonePermission(permissionStatus.state || "prompt");
+        permissionStatus.addEventListener?.("change", handlePermissionChange);
+      } catch {
+        setMicrophonePermission("prompt");
+      }
+    };
+    refresh();
+    return () => {
+      active = false;
+      permissionStatus?.removeEventListener?.("change", handlePermissionChange);
+    };
+  }, [isAppActive]);
+  const {
+    newChatOpen,
+    setNewChatOpen,
+    newChatUsername,
+    setNewChatUsername,
+    newChatError,
+    setNewChatError,
+    newChatResults,
+    setNewChatResults,
+    newChatLoading,
+    newChatSelection,
+    setNewChatSelection,
+  } = useNewChatSearch({
+    user,
+    dmUsernamesRef,
+    searchUsers,
+    debounceMs: NEW_CHAT_SEARCH_DEBOUNCE_MS,
+    maxResults: CHAT_PAGE_CONFIG.newChatSearchMaxResults,
+  });
+  const {
+    chatsSearchQuery,
+    setChatsSearchQuery,
+    discoverLoading,
+    discoverUsers,
+    discoverGroups,
+    discoverChannels,
+    discoverSaved,
+  } = useDiscoverSearch({
+    user,
+    discoverUsersAndGroups,
+    debounceMs: NEW_CHAT_SEARCH_DEBOUNCE_MS,
+    maxResults: CHAT_PAGE_CONFIG.newChatSearchMaxResults,
+  });
+  const {
+    newGroupOpen,
+    setNewGroupOpen,
+    creatingGroup,
+    setCreatingGroup,
+    groupModalType,
+    setGroupModalType,
+    newGroupForm,
+    setNewGroupForm,
+    newGroupSearch,
+    setNewGroupSearch,
+    newGroupSearchResults,
+    setNewGroupSearchResults,
+    newGroupSearchLoading,
+    newGroupMembers,
+    setNewGroupMembers,
+    newGroupError,
+    setNewGroupError,
+    groupInviteOpen,
+    setGroupInviteOpen,
+    createdGroupInviteLink,
+    setCreatedGroupInviteLink,
+    editGroupInviteLink,
+    setEditGroupInviteLink,
+    regeneratingGroupInviteLink,
+    setRegeneratingGroupInviteLink,
+  } = useNewGroupModal({
+    user,
+    chats,
+    activeChatId,
+    editingGroup,
+    searchUsers,
+    debounceMs: NEW_CHAT_SEARCH_DEBOUNCE_MS,
+    maxResults: CHAT_PAGE_CONFIG.newChatSearchMaxResults,
   });
   const [profileForm, setProfileForm] = useState({
     nickname: user?.nickname || "",
@@ -588,7 +695,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const [statusSelection, setStatusSelection] = useState(
     user?.status || "online",
   );
-  const [isConnected, setIsConnected] = useState(false);
   const [isUpdatingChats, setIsUpdatingChats] = useState(false);
   const [sidebarScrollEpoch, setSidebarScrollEpoch] = useState(0);
   const [activePeer, setActivePeer] = useState(null);
@@ -596,25 +702,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     status: "offline",
     lastSeen: null,
   });
-  const [isAppActive, setIsAppActive] = useState(
-    document.visibilityState === "visible" && document.hasFocus(),
-  );
-  const [isMobileViewport, setIsMobileViewport] = useState(
-    typeof window !== "undefined"
-      ? window.matchMedia("(max-width: 767px)").matches
-      : false,
-  );
-  const [notificationsEnabled, setNotificationsEnabled] = useState(() => {
-    if (typeof window === "undefined") return true;
-    const stored = window.localStorage.getItem(NOTIFICATIONS_ENABLED_KEY);
-    return stored === "0" ? false : true;
-  });
-  const [notificationPermission, setNotificationPermission] = useState(() => {
-    if (typeof window === "undefined" || !("Notification" in window)) {
-      return "unsupported";
-    }
-    return Notification.permission;
-  });
+  const [typingByChat, setTypingByChat] = useState({});
 
   const settingsMenuRef = useRef(null);
   const settingsButtonRef = useRef(null);
@@ -627,356 +715,146 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const loadChatsRef = useRef(null);
   const scheduleMessageRefreshRef = useRef(null);
   const presenceStateRef = useRef(new Map());
-  const wasAppActiveRef = useRef(
-    document.visibilityState === "visible" && document.hasFocus(),
-  );
-
-  const truncateText = (text, maxChars) => {
-    const value = String(text || "");
-    if (value.length <= maxChars) return value;
-    return `${value.slice(0, maxChars).trimEnd()}...`;
-  };
-
-  const uaPlatform =
-    typeof navigator !== "undefined"
-      ? navigator.userAgentData?.platform || navigator.platform || ""
-      : "";
-  const uaString =
-    typeof navigator !== "undefined" ? navigator.userAgent || "" : "";
-  const isIOSPlatform = /iP(ad|hone|od)/i.test(uaPlatform);
-  const isIOSDevice = isIOSPlatform || (!uaPlatform && /iP(ad|hone|od)/i.test(uaString));
-  const isStandaloneDisplay =
-    typeof window !== "undefined" &&
-    (window.matchMedia?.("(display-mode: standalone)")?.matches ||
-      window.navigator?.standalone);
-  const isSecureContext =
-    typeof window !== "undefined" && Boolean(window.isSecureContext);
-  const hasNotificationApi =
-    typeof window !== "undefined" && "Notification" in window;
-  const isMobileUa = /Android|iPhone|iPad|iPod/i.test(uaString);
-  const mobileRequiresStandalone = isMobileUa && !isStandaloneDisplay;
-  const notificationsSupported =
-    hasNotificationApi && isSecureContext && !mobileRequiresStandalone;
-  const notificationsAllowed = notificationPermission === "granted";
-  const notificationsActive = notificationsEnabled && notificationsAllowed;
-  const notificationStatusLabel = !isSecureContext
-    ? "Connection is not secure."
-    : mobileRequiresStandalone
-      ? "Require Home screen installation."
-      : !hasNotificationApi
-        ? "Not supported in this browser."
-        : notificationPermission === "denied"
-          ? "Blocked in browser settings."
-          : "";
-  const notificationsDisabled = Boolean(notificationStatusLabel);
-  const notificationsDebugLine = `secure:${isSecureContext ? "yes" : "no"} | support:${
-    notificationsSupported ? "yes" : "no"
-  } | perm:${notificationPermission} | sw:${pushSwReady ? "ready" : "no"} | vapid:${
-    pushVapidReady === null ? "..." : pushVapidReady ? "ok" : "missing"
-  }${pushVapidLength ? "(" + pushVapidLength + ")" : ""} | sub:${
-    pushSubscribeStatus || "..."
-  }${pushSubscribeError ? " | err:" + pushSubscribeError : ""}`;
-  const pushRegistrationRef = useRef(null);
-  const lastPushRefreshRef = useRef(0);
-  const PUSH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-  const PUSH_RESUBSCRIBE_DEBOUNCE_MS = 2 * 60 * 1000;
-
-  const persistNotificationsEnabled = (value) => {
-    setNotificationsEnabled(value);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(NOTIFICATIONS_ENABLED_KEY, value ? "1" : "0");
-    }
-  };
-
-  const requestNotificationPermission = async () => {
-    if (!notificationsSupported) return;
-    try {
-      const result = await Notification.requestPermission();
-      setNotificationPermission(result);
-    } catch {
-      // ignore
-    }
-  };
-
-  const toBase64 = (value) =>
-    String(value || "")
-      .replace(/-/g, "+")
-      .replace(/_/g, "/");
-
-  const urlBase64ToUint8Array = (base64String) => {
-    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-    const base64 = toBase64(base64String) + padding;
-    const rawData = window.atob(base64);
-    const outputArray = new Uint8Array(rawData.length);
-    for (let i = 0; i < rawData.length; ++i) {
-      outputArray[i] = rawData.charCodeAt(i);
-    }
-    return outputArray;
-  };
-
-  const getVapidKeyLength = (key) => {
-    try {
-      const arr = urlBase64ToUint8Array(String(key || ""));
-      return arr?.length || 0;
-    } catch {
-      return 0;
-    }
-  };
-
-  const ensurePushSubscription = async () => {
-    if (typeof window === "undefined") return;
-    if (!("serviceWorker" in navigator)) {
-      setPushSubscribeStatus("no-sw");
-      return;
-    }
-    if (!notificationsSupported) {
-      setPushSubscribeStatus("unsupported");
-      return;
-    }
-    if (notificationPermission !== "granted") {
-      setPushSubscribeStatus("no-perm");
-      return;
-    }
-    try {
-      setPushSubscribeStatus("...");
-      setPushSubscribeError("");
-      const reg =
-        pushRegistrationRef.current ||
-        (await navigator.serviceWorker.ready);
-      if (!reg?.pushManager) {
-        setPushSubscribeStatus("no-push");
-        return;
-      }
-      const keyRes = await fetchPushPublicKey();
-      const keyData = await keyRes.json();
-      if (!keyRes.ok || !keyData?.publicKey) {
-        setPushSubscribeStatus("no-key");
-        return;
-      }
-      const applicationServerKey = urlBase64ToUint8Array(keyData.publicKey);
-      setPushVapidLength(getVapidKeyLength(keyData.publicKey));
-      if (!applicationServerKey || applicationServerKey.length < 1) {
-        setPushSubscribeStatus("bad-key");
-        return;
-      }
-      let subscription = await reg.pushManager.getSubscription();
-      if (!subscription) {
-        subscription = await reg.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey,
-        });
-      }
-      if (!subscription) {
-        setPushSubscribeStatus("no-sub");
-        return;
-      }
-      const json = subscription.toJSON();
-      const res = await subscribePush({
-        username: user.username,
-        subscription: json,
-      });
-      if (!res.ok) {
-        setPushSubscribeStatus("err");
-        setPushSubscribeError(String(res.status || "err"));
-        return;
-      }
-      setPushSubscribeStatus("ok");
-    } catch (err) {
-      setPushSubscribeStatus("err");
-      const message = String(err?.message || err || "subscribe failed");
-      setPushSubscribeError(message);
-    }
-  };
-
-  const maybeRefreshPushSubscription = async (reason = "resume") => {
-    if (typeof window === "undefined") return;
-    if (!notificationsSupported) return;
-    if (notificationPermission !== "granted") return;
-    if (!notificationsEnabled) return;
-    const now = Date.now();
-    const minInterval =
-      reason === "interval" ? PUSH_REFRESH_INTERVAL_MS : PUSH_RESUBSCRIBE_DEBOUNCE_MS;
-    if (now - lastPushRefreshRef.current < minInterval) return;
-    lastPushRefreshRef.current = now;
-    await ensurePushSubscription();
-  };
-
-  const removePushSubscription = async () => {
-    if (typeof window === "undefined") return;
-    if (!("serviceWorker" in navigator)) return;
-    try {
-      const reg =
-        pushRegistrationRef.current ||
-        (await navigator.serviceWorker.ready);
-      const subscription = await reg.pushManager.getSubscription();
-      if (!subscription) return;
-      const endpoint = subscription.endpoint;
-      await subscription.unsubscribe();
-      if (endpoint) {
-        await unsubscribePush({ username: user.username, endpoint });
-      }
-    } catch {
-      // ignore
-    }
-  };
-
-  const handleToggleNotifications = async () => {
-    if (!notificationsSupported) return;
-    if (notificationPermission === "denied") {
-      persistNotificationsEnabled(false);
-      return;
-    }
-    if (notificationsActive) {
-      persistNotificationsEnabled(false);
-      await removePushSubscription();
-      return;
-    }
-    if (!notificationsEnabled) {
-      persistNotificationsEnabled(true);
-    }
-    if (notificationPermission !== "granted") {
-      await requestNotificationPermission();
-    }
-    await ensurePushSubscription();
-  };
-
-  const handleTestPush = async () => {
-    if (!notificationsSupported) return;
-    setTestNotificationSent(true);
-    window.setTimeout(() => setTestNotificationSent(false), 12000);
-    if (notificationPermission !== "granted") {
-      await requestNotificationPermission();
-    }
-    await ensurePushSubscription();
-    try {
-      let res = await sendPushTest({ username: user.username });
-      let data = await res.json();
-      if (!res.ok && String(data?.error || "").toLowerCase().includes("no push subscription")) {
-        await ensurePushSubscription();
-        res = await sendPushTest({ username: user.username });
-        data = await res.json();
-      }
-      if (!res.ok) {
-        if (typeof window !== "undefined") {
-          window.alert(data?.error || "Unable to send test notification.");
-        }
-        return;
-      }
-      try {
-        const reg =
-          pushRegistrationRef.current ||
-          (await navigator.serviceWorker.ready);
-        if (reg?.showNotification) {
-          await reg.showNotification("Songbird", {
-            body: "Test notification",
-            badge: "/icons/icon-192.png",
-            icon: "/icons/icon-192.png",
-            data: { url: "/" },
-          });
-        }
-      } catch {
-        // ignore local test notification failures
-      }
-    } catch {
-      if (typeof window !== "undefined") {
-        window.alert("Unable to send test notification.");
-      }
-    }
-  };
-
-  const summarizeFiles = (files = []) => {
-    if (!Array.isArray(files) || files.length === 0) return "";
-    const videoCount = files.filter((file) =>
-      String(file?.mimeType || "").toLowerCase().startsWith("video/"),
-    ).length;
-    const imageCount = files.filter((file) =>
-      String(file?.mimeType || "").toLowerCase().startsWith("image/"),
-    ).length;
-    const audioCount = files.filter((file) =>
-      String(file?.mimeType || "").toLowerCase().startsWith("audio/"),
-    ).length;
-    const docCount = Math.max(0, files.length - videoCount - imageCount - audioCount);
-    if (files.length === 1) {
-      if (videoCount === 1) return "Sent a video";
-      if (imageCount === 1) return "Sent a photo";
-      if (audioCount === 1) return "Sent a voice message";
-      return "Sent a document";
-    }
-    if (audioCount > 0 && videoCount === 0 && imageCount === 0 && docCount === 0) {
-      return `Sent ${audioCount} voice message${audioCount > 1 ? "s" : ""}`;
-    }
-    if (videoCount > 0 && imageCount === 0 && docCount === 0) {
-      return `Sent ${videoCount} video${videoCount > 1 ? "s" : ""}`;
-    }
-    if (imageCount > 0 && videoCount === 0 && docCount === 0) {
-      return `Sent ${imageCount} photo${imageCount > 1 ? "s" : ""}`;
-    }
-    if (docCount > 0 && imageCount === 0 && videoCount === 0) {
-      return `Sent ${docCount} document${docCount > 1 ? "s" : ""}`;
-    }
-    if (imageCount > 0 && videoCount > 0 && docCount === 0) {
-      return `Sent ${files.length} media files`;
-    }
-    return `Sent ${files.length} files`;
-  };
-
-  const resolveReplyPreview = (msg) => {
-    if (!msg) return { text: "", icon: null };
-    const rawBody = normalizeMessageBody(msg.body).trim();
-    const files = Array.isArray(msg.files)
-      ? msg.files
-      : Array.isArray(msg._files)
-        ? msg._files
-        : [];
-    const videoCount = files.filter((file) =>
-      String(file?.mimeType || "").toLowerCase().startsWith("video/"),
-    ).length;
-    const imageCount = files.filter((file) =>
-      String(file?.mimeType || "").toLowerCase().startsWith("image/"),
-    ).length;
-    const audioCount = files.filter((file) =>
-      String(file?.mimeType || "").toLowerCase().startsWith("audio/"),
-    ).length;
-    const docCount = Math.max(0, files.length - videoCount - imageCount - audioCount);
-    const isMixedMedia = imageCount > 0 && videoCount > 0 && docCount === 0;
-    const hasVoiceOnly = audioCount > 0 && videoCount === 0 && imageCount === 0 && docCount === 0;
-    const icon = hasVoiceOnly
-      ? "voice"
-      : isMixedMedia
-        ? "image"
-        : videoCount > 0
-          ? "video"
-          : imageCount > 0
-            ? "image"
-            : files.length
-              ? "document"
-              : null;
-    let summary = summarizeFiles(files);
-    if (!summary && /^Sent a media file$/i.test(rawBody)) {
-      if (videoCount === 1 && imageCount === 0) summary = "Sent a video";
-      if (imageCount === 1 && videoCount === 0) summary = "Sent a photo";
-    }
-    const isGenericBody =
-      !rawBody ||
-      /^Sent (a media file|a document|a voice message|\d+ files|\d+ media files|\d+ voice messages)$/i.test(
-        rawBody,
-      );
-    if (isMixedMedia && (isGenericBody || /^Sent \d+ files$/i.test(rawBody))) {
-      summary = `Sent ${files.length} media files`;
-    }
-    const text = isGenericBody && summary ? summary : rawBody || summary || "Message";
-    return { text, icon: icon || (docCount > 0 ? "document" : null) };
-  };
+  const typingStateRef = useRef({
+    chatId: 0,
+    isTyping: false,
+    lastSentAt: 0,
+  });
+  const typingStopTimerRef = useRef(null);
+  const typingExpiryTimersRef = useRef(new Map());
+  const loadChatsAbortRef = useRef(null);
+  const loadChatsInFlightRef = useRef(false);
+  const queuedLoadChatsOptionsRef = useRef(null);
 
   const clearUnreadAlignTimers = () => {
     unreadAlignTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     unreadAlignTimersRef.current = [];
   };
 
+  const TYPING_IDLE_TIMEOUT_MS = 3000;
+  const TYPING_SIGNAL_THROTTLE_MS = 1500;
+  const TYPING_REMOTE_TTL_MS = 5000;
+
+  const clearTypingExpiryTimer = useCallback((chatId, username) => {
+    const key = `${Number(chatId || 0)}:${String(username || "").toLowerCase()}`;
+    const timer = typingExpiryTimersRef.current.get(key);
+    if (timer) {
+      window.clearTimeout(timer);
+      typingExpiryTimersRef.current.delete(key);
+    }
+  }, []);
+
+  const removeTypingUser = useCallback((chatId, username) => {
+    const normalizedUsername = String(username || "").toLowerCase();
+    const numericChatId = Number(chatId || 0);
+    if (!numericChatId || !normalizedUsername) return;
+    setTypingByChat((prev) => {
+      const chatTyping = prev?.[numericChatId];
+      if (!chatTyping || !chatTyping[normalizedUsername]) return prev;
+      const nextChatTyping = { ...chatTyping };
+      delete nextChatTyping[normalizedUsername];
+      if (!Object.keys(nextChatTyping).length) {
+        const next = { ...prev };
+        delete next[numericChatId];
+        return next;
+      }
+      return {
+        ...prev,
+        [numericChatId]: nextChatTyping,
+      };
+    });
+  }, []);
+
+  const setTypingUser = useCallback(
+    (chatId, username, nickname = "") => {
+      const normalizedUsername = String(username || "").toLowerCase();
+      const numericChatId = Number(chatId || 0);
+      if (!numericChatId || !normalizedUsername) return;
+      setTypingByChat((prev) => {
+        const chatTyping = prev?.[numericChatId] || {};
+        const nextChatTyping = {
+          ...chatTyping,
+          [normalizedUsername]: {
+            username: normalizedUsername,
+            nickname: String(nickname || "").trim() || normalizedUsername,
+            updatedAt: Date.now(),
+          },
+        };
+        return {
+          ...prev,
+          [numericChatId]: nextChatTyping,
+        };
+      });
+    },
+    [],
+  );
+
+  const scheduleTypingExpiry = useCallback(
+    (chatId, username) => {
+      const normalizedUsername = String(username || "").toLowerCase();
+      const numericChatId = Number(chatId || 0);
+      if (!numericChatId || !normalizedUsername) return;
+      clearTypingExpiryTimer(numericChatId, normalizedUsername);
+      const key = `${numericChatId}:${normalizedUsername}`;
+      const timer = window.setTimeout(() => {
+        typingExpiryTimersRef.current.delete(key);
+        removeTypingUser(numericChatId, normalizedUsername);
+      }, TYPING_REMOTE_TTL_MS);
+      typingExpiryTimersRef.current.set(key, timer);
+    },
+    [clearTypingExpiryTimer, removeTypingUser, TYPING_REMOTE_TTL_MS],
+  );
+
+  const sendTypingSignal = useCallback(
+    (chatId, isTyping) => {
+      const numericChatId = Number(chatId || 0);
+      const currentUsername = String(usernameRef.current || "").toLowerCase();
+      if (!numericChatId || !currentUsername) return;
+      const activeChatType = String(activeChatTypeRef.current || "").toLowerCase();
+      if (Boolean(isTyping) && activeChatType === "channel") return;
+      const canBroadcastTyping =
+        String(user?.status || "").toLowerCase() === "online";
+      if (!canBroadcastTyping && Boolean(isTyping)) return;
+      sendTypingIndicator({
+        chatId: numericChatId,
+        username: currentUsername,
+        isTyping: Boolean(isTyping),
+      }).catch(() => null);
+    },
+    [user?.status],
+  );
+
+  const clearLocalTypingStopTimer = useCallback(() => {
+    if (typingStopTimerRef.current) {
+      window.clearTimeout(typingStopTimerRef.current);
+      typingStopTimerRef.current = null;
+    }
+  }, []);
+
+  const stopTypingIndicator = useCallback(
+    (chatIdOverride = null) => {
+      const targetChatId =
+        Number(chatIdOverride || 0) ||
+        Number(typingStateRef.current.chatId || activeChatIdRef.current || 0);
+      if (!targetChatId) return;
+      clearLocalTypingStopTimer();
+      if (typingStateRef.current.isTyping) {
+        sendTypingSignal(targetChatId, false);
+      }
+      typingStateRef.current = {
+        chatId: targetChatId,
+        isTyping: false,
+        lastSentAt: Date.now(),
+      };
+    },
+    [clearLocalTypingStopTimer, sendTypingSignal],
+  );
+
   const handleStartReply = (msg) => {
     if (!msg) return;
     const targetId = Number(msg.id || msg._serverId || 0);
     if (!targetId) return;
+    setEditTarget(null);
     // In channel chats, show the channel name instead of the message author's name
     const replyName = isActiveChannelChat
       ? (activeChat?.name || "Channel")
@@ -1018,6 +896,153 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         scrollChatToBottom("auto");
       }, 80);
     }
+  };
+
+  const handleStartEdit = (msg) => {
+    if (!msg) return;
+    const targetId = Number(msg.id || msg._serverId || 0);
+    if (!targetId) return;
+    setReplyTarget(null);
+    setEditTarget({
+      id: targetId,
+      username: msg.username || "",
+      nickname: msg.nickname || "",
+      displayName:
+        msg.nickname || msg.username || activeChat?.name || "Unknown",
+      body: msg.body || "",
+      files: Array.isArray(msg.files) ? msg.files : [],
+    });
+    if (!userScrolledUpRef.current) {
+      pendingScrollToBottomRef.current = true;
+      scrollChatToBottom("auto");
+      requestAnimationFrame(() => {
+        scrollChatToBottom("auto");
+      });
+      window.setTimeout(() => {
+        scrollChatToBottom("auto");
+      }, 80);
+    }
+  };
+
+  const handleClearEdit = () => {
+    setEditTarget(null);
+  };
+
+  const handleOpenForwardModal = (message) => {
+    if (!message) return;
+    void (async () => {
+      try {
+        let savedChat = chats.find((chat) => String(chat?.type || "").toLowerCase() === "saved");
+        if (!savedChat) {
+          const res = await getSavedMessagesChat(user.username);
+          const data = await res.json();
+          if (res.ok && Number(data?.id || 0)) {
+            savedChat = {
+              id: Number(data.id),
+              type: "saved",
+              name: "Saved messages",
+              members: [],
+              group_color: "#10b981",
+              group_avatar_url: "",
+              last_outgoing_time: null,
+              last_time: null,
+            };
+          }
+        }
+        setForwardSavedChat(savedChat || null);
+      } catch {
+        // ignore
+      } finally {
+        setForwardMessageTarget(message);
+      }
+    })();
+  };
+
+  const handleSaveMessageFiles = useCallback((message) => {
+    const files = getMessageFiles(message);
+    if (!files.length) return;
+    downloadMessageFiles(files);
+  }, []);
+
+  const handleOpenForwardOrigin = async (target) => {
+    if (!target) return;
+    if (target.kind === "self") {
+      openOwnProfileModal();
+      return;
+    }
+    if (target.kind === "user") {
+      openMemberProfileFromList({
+        id: Number(target.userId || 0) || null,
+        username: target.username || "",
+        nickname: target.nickname || "",
+        avatar_url: target.avatar_url || "",
+        color: target.color || "#10b981",
+        status: "online",
+        role: "",
+      });
+      return;
+    }
+    const numericChatId = Number(target.chatId || 0);
+    if (!numericChatId) return;
+    let targetChat = chats.find((chat) => Number(chat.id) === numericChatId);
+    if (!targetChat) {
+      try {
+        const res = await getChatPreview({
+          chatId: numericChatId,
+          username: user.username,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || "Unable to open forwarded chat.");
+        }
+        targetChat = {
+          id: Number(data?.id || numericChatId),
+          type: data?.type || "group",
+          name: data?.name || "Chat",
+          group_username: data?.username || "",
+          group_visibility: data?.visibility || "public",
+          group_color: data?.color || "#10b981",
+          group_avatar_url: data?.avatarUrl || "",
+          invite_token: data?.inviteToken || "",
+          membersCount: Number(data?.membersCount || 0),
+          members: [],
+          _previewOnly: true,
+          _isMember: Boolean(data?.isMember),
+        };
+      } catch {
+        return;
+      }
+    }
+    if (String(targetChat.type || "").toLowerCase() === "dm") {
+      const peer = (targetChat.members || []).find(
+        (member) =>
+          String(member?.username || "").toLowerCase() !==
+          String(user?.username || "").toLowerCase(),
+      );
+      if (peer) {
+        openMemberProfileFromList(peer);
+      }
+      return;
+    }
+    setMentionProfile({
+      kind: String(targetChat.type || "group").toLowerCase(),
+      chatId: Number(targetChat.id || 0),
+      name: targetChat.name || "Chat",
+      username: targetChat.group_username || "",
+      visibility: targetChat.group_visibility || "public",
+      color: targetChat.group_color || "#10b981",
+      avatarUrl: targetChat.group_avatar_url || "",
+      inviteToken: targetChat.invite_token || "",
+      membersCount:
+        Array.isArray(targetChat.members) && targetChat.members.length
+          ? targetChat.members.length
+          : Number(targetChat.membersCount || 0),
+      isMember:
+        targetChat._previewOnly === true
+          ? Boolean(targetChat._isMember)
+          : true,
+    });
+    setProfileModalOpen(true);
   };
 
   const scheduleUnreadAnchorAlignment = (unreadId) => {
@@ -1091,11 +1116,13 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     handleJumpToLatest,
     handleMessageMediaLoaded,
     scrollChatToBottom,
+    cancelSmoothScroll,
   } = useChatScroll({
     activeChatId,
     canMarkReadInCurrentView,
     chatScrollRef,
     clearUnreadAlignTimers,
+    smoothScrollLockRef,
     messages,
     user,
     isAppActive,
@@ -1127,6 +1154,38 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [user?.username]);
 
   useEffect(() => {
+    const nextBlobUrls = new Set();
+    const appendIfBlob = (value) => {
+      const url = String(value || "");
+      if (url.startsWith("blob:")) {
+        nextBlobUrls.add(url);
+      }
+    };
+    messages.forEach((msg) => {
+      const pendingFiles = Array.isArray(msg?._files) ? msg._files : [];
+      pendingFiles.forEach((file) => {
+        appendIfBlob(file?._localUrl);
+        appendIfBlob(file?.url);
+      });
+      const messageFiles = Array.isArray(msg?.files) ? msg.files : [];
+      messageFiles.forEach((file) => {
+        appendIfBlob(file?._localUrl);
+        appendIfBlob(file?.url);
+      });
+    });
+
+    messageBlobUrlsRef.current.forEach((url) => {
+      if (nextBlobUrls.has(url)) return;
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore invalid/revoked object URLs
+      }
+    });
+    messageBlobUrlsRef.current = nextBlobUrls;
+  }, [messages]);
+
+  useEffect(() => {
     return () => {
       pendingUploadFilesRef.current.forEach((file) => {
         if (file.previewUrl) {
@@ -1139,46 +1198,39 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       if (pendingGroupAvatarFile?.previewUrl) {
         URL.revokeObjectURL(pendingGroupAvatarFile.previewUrl);
       }
+      messageBlobUrlsRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore invalid/revoked object URLs
+        }
+      });
+      messageBlobUrlsRef.current.clear();
       clearUnreadAlignTimers();
     };
   }, [pendingGroupAvatarFile]);
 
   useEffect(() => {
-    if (user) {
-      if (pendingAvatarFile?.previewUrl) {
-        URL.revokeObjectURL(pendingAvatarFile.previewUrl);
-      }
-      setPendingAvatarFile(null);
-      setProfileForm({
-        nickname: user.nickname || "",
-        username: user.username || "",
-        avatarUrl: user.avatarUrl || "",
-      });
-      setAvatarPreview(user.avatarUrl || "");
-      setStatusSelection(
-        user.status === "idle" ? "online" : user.status || "online",
-      );
-    }
+    if (!user) return;
+    setPendingAvatarFile(null);
+    setProfileForm({
+      nickname: user.nickname || "",
+      username: user.username || "",
+      avatarUrl: user.avatarUrl || "",
+    });
+    setAvatarPreview(user.avatarUrl || "");
+    setStatusSelection(user.status || "online");
   }, [user]);
 
   useEffect(() => {
     if (!user?.username) return;
-    const cached = readChatListCache(user.username);
-    if (cached && Array.isArray(cached.chats) && cached.chats.length > 0) {
-      const normalizedCached = cached.chats.map((chat) => ({
-        ...chat,
-        last_message: normalizeMessageBody(chat.last_message),
-      }));
-      setChats((prev) => (prev.length ? prev : normalizedCached));
-      setLoadingChats(false);
-      return;
-    }
     if (!canUseIdb()) return;
     let isActive = true;
     void (async () => {
       const idbCached = await readChatListCacheAsync(user.username);
       if (!isActive || !idbCached) return;
-      if (!Array.isArray(idbCached.chats) || idbCached.chats.length === 0) return;
+      if (!Array.isArray(idbCached.chats) || idbCached.chats.length === 0)
+        return;
       const normalizedCached = idbCached.chats.map((chat) => ({
         ...chat,
         last_message: normalizeMessageBody(chat.last_message),
@@ -1193,7 +1245,20 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
   useEffect(() => {
     if (!user?.username) return;
-    const index = readMessagesIndex(user.username);
+    void migrateLocalCacheToIdb(user.username);
+  }, [user?.username]);
+
+  useEffect(() => {
+    if (!user?.username) return;
+    pruneMessagesCacheMemory(messagesCacheRef.current, activeChatIdRef.current);
+  }, [user?.username]);
+
+  useEffect(() => {
+    pruneMessagesCacheMemory(messagesCacheRef.current, activeChatId);
+  }, [activeChatId, chats.length]);
+
+  useEffect(() => {
+    if (!user?.username) return;
     const pruneIndex = (items) => {
       if (!items.length) return;
       const now = Date.now();
@@ -1202,7 +1267,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         const updatedAt = Number(entry?.updatedAt);
         if (!chatId || !Number.isFinite(updatedAt)) return false;
         if (now - updatedAt > CHAT_PAGE_CONFIG.cacheTtlMs) {
-          removeLocalCache(buildMessagesCacheKey(user.username, chatId));
           void deleteIdbCache(CACHE_STORES.messages, buildMessagesCacheKey(user.username, chatId));
           return false;
         }
@@ -1213,10 +1277,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         writeMessagesIndex(user.username, trimmed);
       }
     };
-    if (index.length) {
-      pruneIndex(index);
-      return;
-    }
     if (!canUseIdb()) return;
     let isActive = true;
     void (async () => {
@@ -1237,6 +1297,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
   useEffect(() => {
     return () => {
+      messagesCacheRef.current.clear();
       if (mediaLoadSnapTimerRef.current) {
         window.clearTimeout(mediaLoadSnapTimerRef.current);
       }
@@ -1246,23 +1307,14 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       if (channelSeenTimerRef.current) {
         window.clearTimeout(channelSeenTimerRef.current);
       }
+      if (loadChatsAbortRef.current) {
+        loadChatsAbortRef.current.abort();
+        loadChatsAbortRef.current = null;
+      }
+      loadChatsInFlightRef.current = false;
+      queuedLoadChatsOptionsRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    if (!notificationsSupported) return;
-    const syncPermission = () => {
-      setNotificationPermission(Notification.permission);
-    };
-    syncPermission();
-    window.addEventListener("focus", syncPermission);
-    document.addEventListener("visibilitychange", syncPermission);
-    return () => {
-      window.removeEventListener("focus", syncPermission);
-      document.removeEventListener("visibilitychange", syncPermission);
-    };
-  }, [notificationsSupported]);
-
 
   useEffect(() => {
     const totalUnreadCount = chats.reduce(
@@ -1285,13 +1337,36 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
   }, [chats]);
 
+  const getNetworkBackoffMultiplier = () => {
+    if (typeof navigator === "undefined") return 1;
+    const connection =
+      navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (!connection) return 1;
+    let factor = 1;
+    if (connection.saveData) {
+      factor = Math.max(factor, 2.2);
+    }
+    const effectiveType = String(connection.effectiveType || "").toLowerCase();
+    if (effectiveType === "slow-2g" || effectiveType === "2g") {
+      factor = Math.max(factor, 2.5);
+    } else if (effectiveType === "3g") {
+      factor = Math.max(factor, 1.6);
+    }
+    return factor;
+  };
+
   useEffect(() => {
-    if (!user || sseConnected) return;
+    if (!user || sseConnected || !isAppActive) return;
+    const backoff = getNetworkBackoffMultiplier();
+    const intervalMs = Math.max(
+      3000,
+      Math.round(CHAT_PAGE_CONFIG.chatsRefreshIntervalMs * backoff),
+    );
     const interval = setInterval(() => {
       void loadChats({ silent: true });
-    }, CHAT_PAGE_CONFIG.chatsRefreshIntervalMs);
+    }, intervalMs);
     return () => clearInterval(interval);
-  }, [user, sseConnected]);
+  }, [user, sseConnected, isAppActive]);
 
   useEffect(() => {
     if (!user) return;
@@ -1309,231 +1384,11 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [user, isAppActive]);
 
   useEffect(() => {
-    const usernames = new Set();
-    (chats || []).forEach((chat) => {
-      if (chat.type !== "dm") return;
-      const members = Array.isArray(chat.members) ? chat.members : [];
-      const other =
-        members.find(
-          (member) =>
-            String(member?.username || "").toLowerCase() !==
-            String(user.username || "").toLowerCase(),
-        ) || null;
-      const otherUsername = String(
-        other?.username ||
-          chat?.username ||
-          chat?.peer_username ||
-          chat?.dm_username ||
-          "",
-      )
-        .toLowerCase()
-        .trim();
-      if (otherUsername && otherUsername !== String(user.username || "").toLowerCase()) {
-        usernames.add(otherUsername);
-      }
-    });
-    dmUsernamesRef.current = usernames;
-  }, [chats, user.username]);
-
-  useEffect(() => {
-    if (!newChatOpen) return;
-    if (!newChatUsername.trim()) {
-      setNewChatResults([]);
-      setNewChatSelection(null);
-      return;
-    }
-    const handle = setTimeout(async () => {
-      try {
-        setNewChatLoading(true);
-        const res = await searchUsers({
-          exclude: user.username,
-          query: newChatUsername.trim().toLowerCase(),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || "Unable to search users.");
-        }
-        const dmUsernames = dmUsernamesRef.current;
-        const users = (data.users || [])
-          .filter(
-            (candidate) =>
-              !dmUsernames.has(String(candidate.username || "").toLowerCase()),
-          )
-          .slice(0, CHAT_PAGE_CONFIG.newChatSearchMaxResults);
-        setNewChatResults(users);
-      } catch (err) {
-        setNewChatError(err.message);
-      } finally {
-        setNewChatLoading(false);
-      }
-    }, NEW_CHAT_SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(handle);
-  }, [newChatUsername, newChatOpen, user.username]);
-
-  useEffect(() => {
-    if (!newGroupOpen) return;
-    if (!newGroupSearch.trim()) {
-      setNewGroupSearchResults([]);
-      return;
-    }
-    const handle = setTimeout(async () => {
-      try {
-        setNewGroupSearchLoading(true);
-        const res = await searchUsers({
-          exclude: user.username,
-          query: newGroupSearch.trim().toLowerCase(),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || "Unable to search users.");
-        }
-        const selectedUsernames = new Set(
-          newGroupMembers.map((member) => String(member?.username || "")),
-        );
-        const currentEditingChat = chats.find(
-          (chat) => Number(chat.id) === Number(activeChatId),
-        );
-        if (editingGroup && ["group", "channel"].includes(currentEditingChat?.type)) {
-          (currentEditingChat.members || []).forEach((member) => {
-            const memberUsername = String(member?.username || "").toLowerCase();
-            if (
-              memberUsername &&
-              memberUsername !== String(user.username || "").toLowerCase()
-            ) {
-              selectedUsernames.add(memberUsername);
-            }
-          });
-        }
-        const users = (data.users || [])
-          .filter(
-            (candidate) =>
-              !selectedUsernames.has(String(candidate.username || "").toLowerCase()),
-          )
-          .slice(0, CHAT_PAGE_CONFIG.newChatSearchMaxResults);
-        setNewGroupSearchResults(users);
-      } catch (err) {
-        setNewGroupError(err.message);
-      } finally {
-        setNewGroupSearchLoading(false);
-      }
-    }, NEW_CHAT_SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(handle);
-  }, [newGroupSearch, newGroupOpen, newGroupMembers, user.username, editingGroup, chats, activeChatId]);
-
-  useEffect(() => {
-    const query = String(chatsSearchQuery || "").trim();
-    if (!query) {
-      setDiscoverLoading(false);
-      setDiscoverUsers([]);
-      setDiscoverGroups([]);
-      setDiscoverChannels([]);
-      setDiscoverSaved(false);
-      return;
-    }
-    const normalizedQuery = query.toLowerCase();
-    const savedMatch =
-      normalizedQuery.includes("saved") || normalizedQuery.includes("bookmark");
-    setDiscoverSaved(savedMatch);
-    let cancelled = false;
-    const timer = setTimeout(async () => {
-      try {
-        setDiscoverLoading(true);
-        const res = await discoverUsersAndGroups({
-          username: user.username,
-          query: normalizedQuery,
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || "Unable to search.");
-        }
-        if (cancelled) return;
-        setDiscoverUsers(
-          (Array.isArray(data?.users) ? data.users : []).slice(
-            0,
-            CHAT_PAGE_CONFIG.newChatSearchMaxResults,
-          ),
-        );
-        setDiscoverGroups(
-          (Array.isArray(data?.groups) ? data.groups : []).slice(
-            0,
-            CHAT_PAGE_CONFIG.newChatSearchMaxResults,
-          ),
-        );
-        setDiscoverChannels(
-          (Array.isArray(data?.channels) ? data.channels : []).slice(
-            0,
-            CHAT_PAGE_CONFIG.newChatSearchMaxResults,
-          ),
-        );
-      } catch {
-        if (cancelled) return;
-        setDiscoverUsers([]);
-        setDiscoverGroups([]);
-        setDiscoverChannels([]);
-      } finally {
-        if (!cancelled) {
-          setDiscoverLoading(false);
-        }
-      }
-    }, NEW_CHAT_SEARCH_DEBOUNCE_MS);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [chatsSearchQuery, user.username]);
-
-  useEffect(() => {
-    let isMounted = true;
-    const checkHealth = async () => {
-      try {
-        const res = await fetchHealth();
-        if (!res.ok) throw new Error("Not connected");
-        const data = await res.json();
-        if (isMounted) {
-          setIsConnected(Boolean(data?.ok));
-        }
-      } catch {
-        if (isMounted) {
-          setIsConnected(false);
-        }
-      }
-    };
-    checkHealth();
-    const interval = setInterval(
-      checkHealth,
-      CHAT_PAGE_CONFIG.healthCheckIntervalMs,
-    );
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const media = window.matchMedia("(max-width: 767px)");
-    const update = () => setIsMobileViewport(media.matches);
-    update();
-    if (media.addEventListener) {
-      media.addEventListener("change", update);
-      return () => media.removeEventListener("change", update);
-    }
-    media.addListener(update);
-    return () => media.removeListener(update);
-  }, []);
-
-  useEffect(() => {
     if (user && activeChatId) {
       const openedChatId = Number(activeChatId);
       const openedChat = chats.find((chat) => chat.id === openedChatId);
-      let cached = messagesCacheRef.current.get(openedChatId) || null;
-      if (!cached && user?.username) {
-        const persisted = readMessagesCache(user.username, openedChatId);
-        if (persisted && Array.isArray(persisted.messages)) {
-          cached = persisted;
-          messagesCacheRef.current.set(openedChatId, persisted);
-        }
-      }
+      let cached = readMessagesCacheMemory(messagesCacheRef.current, openedChatId) || null;
+      // IDB async load below will hydrate if needed.
       const hasCachedMessages = Array.isArray(cached?.messages) && cached.messages.length > 0;
       openingHadUnreadRef.current = Boolean((openedChat?.unread_count || 0) > 0);
       openingUnreadCountRef.current = Number(openedChat?.unread_count || 0);
@@ -1577,13 +1432,18 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         typeof document !== "undefined" &&
         document.visibilityState === "visible" &&
         document.hasFocus();
-      if (!hasCachedMessages && user?.username && canUseIdb()) {
+      if (user?.username && canUseIdb()) {
         const activeId = openedChatId;
         void (async () => {
           const idbCached = await readMessagesCacheAsync(user.username, activeId);
           if (!idbCached || !Array.isArray(idbCached.messages)) return;
           if (Number(activeChatIdRef.current) !== activeId) return;
-          messagesCacheRef.current.set(activeId, idbCached);
+          writeMessagesCacheMemory(
+            messagesCacheRef.current,
+            activeId,
+            idbCached,
+            activeChatIdRef.current,
+          );
           setMessages((prev) =>
             prev.length ? prev : normalizeMessagesForRender(idbCached.messages),
           );
@@ -1643,6 +1503,41 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [activeChatId]);
 
   useEffect(() => {
+    return () => {
+      const current = typingStateRef.current;
+      if (current.isTyping && current.chatId) {
+        sendTypingSignal(current.chatId, false);
+      }
+      clearLocalTypingStopTimer();
+      typingExpiryTimersRef.current.forEach((timer) => {
+        window.clearTimeout(timer);
+      });
+      typingExpiryTimersRef.current.clear();
+    };
+  }, [clearLocalTypingStopTimer, sendTypingSignal]);
+
+  useEffect(() => {
+    const status = String(user?.status || "").toLowerCase();
+    if (status !== "online") {
+      stopTypingIndicator(activeChatIdRef.current);
+    }
+  }, [stopTypingIndicator, user?.status]);
+
+  useEffect(() => {
+    const currentState = typingStateRef.current;
+    const currentChatId = Number(activeChatId || 0);
+    if (!currentState.isTyping) return;
+    if (!currentState.chatId || currentState.chatId === currentChatId) return;
+    sendTypingSignal(currentState.chatId, false);
+    clearLocalTypingStopTimer();
+    typingStateRef.current = {
+      chatId: currentState.chatId,
+      isTyping: false,
+      lastSentAt: Date.now(),
+    };
+  }, [activeChatId, clearLocalTypingStopTimer, sendTypingSignal]);
+
+  useEffect(() => {
     const prev = prevUploadProgressRef.current;
     const now = activeUploadProgress;
     // When upload bar closes, force a final snap to bottom.
@@ -1662,91 +1557,89 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     prevUploadProgressRef.current = now;
   }, [activeUploadProgress, activeChatId]);
 
-  const activeId = activeChatId ? Number(activeChatId) : null;
-  activeChatIdRef.current = activeId;
-  const visibleChats = useMemo(() => {
-    const query = String(chatsSearchQuery || "").trim().toLowerCase();
-    if (!query) return chats;
-    return chats.filter((chat) => {
-      const members = Array.isArray(chat?.members) ? chat.members : [];
-      const chatType = String(chat?.type || "").toLowerCase();
-      if (chatType === "group" || chatType === "channel") {
-        const groupName = String(chat?.name || "").toLowerCase();
-        const groupUsername = String(chat?.group_username || "").toLowerCase();
-        return groupName.includes(query) || groupUsername.includes(query);
-      }
-      if (chatType === "saved") {
-        const label = String(chat?.name || "saved messages").toLowerCase();
-        return label.includes(query) || "saved messages".includes(query);
-      }
-      const other = members.find(
-        (member) =>
-          String(member?.username || "").toLowerCase() !==
-          String(user?.username || "").toLowerCase(),
-      );
-      const nickname = String(other?.nickname || "").toLowerCase();
-      const username = String(other?.username || "").toLowerCase();
-      return nickname.includes(query) || username.includes(query);
-    });
-  }, [chats, chatsSearchQuery, user?.username]);
-  const activeChat =
-    visibleChats.find((conv) => conv.id === activeId) ||
-    chats.find((conv) => conv.id === activeId);
-
-  useEffect(() => {
-    activeChatTypeRef.current = activeChat?.type || null;
-  }, [activeChat?.type]);
-  const activeMembers = activeChat?.members || [];
-  const isActiveGroupChat = activeChat?.type === "group";
-  const isActiveChannelChat = activeChat?.type === "channel";
-  const isActiveSavedChat = activeChat?.type === "saved";
-  const isActiveOwner = activeMembers.some(
-    (member) =>
-      Number(member.id) === Number(user?.id || 0) &&
-      String(member.role || "").toLowerCase() === "owner",
-  );
-  const canSendInActiveChat = !isActiveChannelChat || isActiveOwner;
-  const activeGroupMemberUsernames = useMemo(() => {
-    if (!isActiveGroupChat && !isActiveChannelChat) return [];
-    return (activeMembers || [])
-      .map((member) => String(member?.username || "").toLowerCase())
-      .filter(Boolean)
-      .sort();
-  }, [isActiveGroupChat, isActiveChannelChat, activeMembers]);
-  const activeGroupMemberUsernamesKey = activeGroupMemberUsernames.join("|");
-  const activeDmMember =
-    activeChat?.type === "dm"
-      ? activeMembers.find((member) => member.username !== user.username)
-      : null;
-  const isDeletedDm = activeChat?.type === "dm" && !activeDmMember;
-  const deletedDmPeer = isDeletedDm
-    ? {
-        nickname: "Deleted account",
-        username: "",
-        color: "#94a3b8",
-        avatar_url: "",
-        isDeleted: true,
-      }
-    : null;
-  const activeHeaderPeer = activePeer || activeDmMember || deletedDmPeer;
-  const activeFallbackTitle = isActiveGroupChat || isActiveChannelChat
-    ? activeChat?.name || (isActiveChannelChat ? "Channel" : "Group")
-    : isActiveSavedChat
-      ? "Saved messages"
-      : activeHeaderPeer?.nickname || activeHeaderPeer?.username || "Select a chat";
-  const activeHeaderAvatar = isActiveGroupChat || isActiveChannelChat || isActiveSavedChat
-    ? null
-    : activeHeaderPeer;
-  const activeGroupAvatarColor = isActiveGroupChat || isActiveChannelChat
-    ? activeChat?.group_color || "#10b981"
-    : null;
-  const activeGroupAvatarUrl = isActiveGroupChat || isActiveChannelChat
-    ? activeChat?.group_avatar_url || ""
-    : "";
+  const {
+    activeId,
+    visibleChats,
+    activeChat,
+    activeMembers,
+    isActiveGroupChat,
+    isActiveChannelChat,
+    isActiveSavedChat,
+    canSendInActiveChat,
+    activeGroupMemberUsernames,
+    activeGroupMemberUsernamesKey,
+    activeHeaderPeer,
+    activeFallbackTitle,
+    activeHeaderAvatar,
+    activeGroupAvatarColor,
+    activeGroupAvatarUrl,
+    headerAvatarColor,
+  } = useActiveChatState({
+    chats,
+    chatsSearchQuery,
+    user,
+    activeChatId,
+    activeChatIdRef,
+    activeChatTypeRef,
+    activePeer,
+  });
   const activeHeaderAvatarIcon = isActiveSavedChat ? (
     <Bookmark size={18} className="text-white" />
   ) : null;
-  const headerAvatarColor = isActiveSavedChat ? "#10b981" : activeGroupAvatarColor;
+
+  useEffect(() => {
+    if (canSendInActiveChat) return;
+    stopTypingIndicator(activeChatIdRef.current);
+  }, [canSendInActiveChat, stopTypingIndicator]);
+
+  const {
+    loadMessages,
+    loadingMessages,
+    setLoadingMessages,
+    hasOlderMessages,
+    setHasOlderMessages,
+  } = useMessagesLoader({
+    user,
+    chats,
+    activeChat,
+    activeChatIdRef,
+    activeChatTypeRef,
+    isActiveChannelChat,
+    isAppActive,
+    isMobileViewport,
+    mobileTab,
+    setMessages,
+    setUnreadInChat,
+    setUnreadMarkerId,
+    setUserScrolledUp,
+    setIsAtBottom,
+    setChannelSeenCounts,
+    lastMessageIdRef,
+    openingChatRef,
+    openingUnreadCountRef,
+    openingHadUnreadRef,
+    pendingScrollToUnreadRef,
+    unreadMarkerIdRef,
+    pendingScrollToBottomRef,
+    userScrolledUpRef,
+    isAtBottomRef,
+    unreadAnchorLockUntilRef,
+    shouldAutoMarkReadRef,
+    allowStartReachedRef,
+    formatDayLabel,
+    formatTime,
+    parseServerDate,
+    resolveReplyPreview,
+    normalizeMessageBody,
+    CHAT_PAGE_CONFIG,
+    listMessagesByQuery,
+    markMessagesRead,
+  });
+  usePerfTelemetry({
+    activeChatId,
+    messagesLength: messages.length,
+    loadingMessages,
+  });
 
   const getVisibleChannelMessageIds = useCallback(() => {
     if (!chatScrollRef.current) return [];
@@ -1833,7 +1726,24 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
     channelSeenQueueRef.current = [];
     channelSeenLoadedRef.current = new Set();
-    setChannelSeenCounts(readChannelSeenCache(user?.username, activeChatId));
+    if (canUseIdb()) {
+      let isActive = true;
+      void (async () => {
+        const counts = await readChannelSeenCacheAsync(
+          user?.username,
+          activeChatId,
+        );
+        if (isActive) {
+          setChannelSeenCounts(counts);
+        }
+      })();
+      requestAnimationFrame(() => {
+        enqueueChannelSeenCounts();
+      });
+      return () => {
+        isActive = false;
+      };
+    }
     requestAnimationFrame(() => {
       enqueueChannelSeenCounts();
     });
@@ -1856,7 +1766,12 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
   useEffect(() => {
     if (!isActiveChannelChat || !activeChatId) return;
-    writeChannelSeenCache(user?.username, activeChatId, channelSeenCounts);
+    if (!canUseIdb()) return;
+    void writeChannelSeenCacheAsync(
+      user?.username,
+      activeChatId,
+      channelSeenCounts,
+    );
   }, [channelSeenCounts, isActiveChannelChat, activeChatId, user?.username]);
 
   const handleChatScrollWithSeen = useCallback(
@@ -1878,11 +1793,14 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   };
   const handleDeleteChats = () => requestDeleteChats(selectedChats);
   const handleOpenSettings = () => setShowSettings((prev) => !prev);
+  const handleOpenWhatsNew = () => {
+    setShowSettings(false);
+    openWhatsNew();
+  };
 
   const displayName = user.nickname || user.username;
   const displayInitials = getAvatarInitials(displayName);
-  const statusValueRaw = user.status || "online";
-  const statusValue = statusValueRaw === "idle" ? "online" : statusValueRaw;
+  const statusValue = user.status || "online";
   const statusDotClass =
     statusValue === "invisible"
       ? "bg-slate-400"
@@ -1966,6 +1884,93 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         : peerPresence.status === "online"
           ? "online"
           : "offline";
+  const activeTypingUsers = useMemo(() => {
+    const chatId = Number(activeChatId || 0);
+    if (!chatId) return [];
+    const typingMap = typingByChat?.[chatId];
+    if (!typingMap || typeof typingMap !== "object") return [];
+    const selfUsername = String(user?.username || "").toLowerCase();
+    const membersByUsername = new Map(
+      (Array.isArray(activeMembers) ? activeMembers : []).map((member) => [
+        String(member?.username || "").toLowerCase(),
+        member,
+      ]),
+    );
+    return Object.values(typingMap)
+      .map((entry) => ({
+        username: String(entry?.username || "").toLowerCase(),
+        nickname: String(entry?.nickname || "").trim(),
+      }))
+      .filter((entry) => entry.username && entry.username !== selfUsername)
+      .filter((entry) => {
+        if (isActiveGroupChat || isActiveChannelChat) return true;
+        const peerUsername = String(activeHeaderPeer?.username || "").toLowerCase();
+        return peerUsername && entry.username === peerUsername;
+      })
+      .map((entry) => {
+        const member = membersByUsername.get(entry.username);
+        const displayName =
+          String(member?.nickname || "").trim() ||
+          String(entry.nickname || "").trim() ||
+          String(member?.username || "").trim() ||
+          entry.username;
+        return {
+          username: entry.username,
+          displayName,
+        };
+      });
+  }, [
+    activeChatId,
+    activeHeaderPeer?.username,
+    activeMembers,
+    isActiveChannelChat,
+    isActiveGroupChat,
+    typingByChat,
+    user?.username,
+  ]);
+  const buildTypingDisplayName = useCallback((value, maxChars = 22) => {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+  }, []);
+  const typingIndicator = useMemo(() => {
+    if (!activeTypingUsers.length) return null;
+    if (isActiveChannelChat) return null;
+    if (isActiveGroupChat) {
+      if (activeTypingUsers.length === 1) {
+        const name = buildTypingDisplayName(activeTypingUsers[0].displayName, 28);
+        return {
+          type: "group_single",
+          name,
+          label: name,
+          fullLabel: activeTypingUsers[0].displayName,
+        };
+      }
+      if (activeTypingUsers.length === 2) {
+        const first = buildTypingDisplayName(activeTypingUsers[0].displayName, 16);
+        const second = buildTypingDisplayName(activeTypingUsers[1].displayName, 16);
+        return {
+          type: "group_pair",
+          firstName: first,
+          secondName: second,
+          label: `${first} and ${second}`,
+          fullLabel: `${activeTypingUsers[0].displayName} and ${activeTypingUsers[1].displayName}`,
+        };
+      }
+      const first = buildTypingDisplayName(activeTypingUsers[0].displayName, 18);
+      const othersCount = activeTypingUsers.length - 1;
+      return {
+        type: "group_multi",
+        label: `${first} and ${othersCount.toLocaleString("en-US")} others`,
+        fullLabel: `${activeTypingUsers[0].displayName} and ${othersCount.toLocaleString("en-US")} others`,
+      };
+    }
+    return {
+      type: "dm",
+      label: "typing",
+    };
+  }, [activeTypingUsers, buildTypingDisplayName, isActiveChannelChat, isActiveGroupChat]);
   const activeMembersLabel = Number(activeMembers.length || 0)
     .toLocaleString("en-US");
   const activeHeaderSubtitle = isActiveGroupChat || isActiveChannelChat
@@ -1973,6 +1978,10 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     : isActiveSavedChat
       ? ""
       : peerStatusLabel;
+  const resolvedHeaderSubtitle =
+    !isActiveSavedChat && typingIndicator?.label
+      ? typingIndicator.label
+      : activeHeaderSubtitle;
   const activeChatMuted = Boolean(activeChat?._muted);
   const mentionProfileUser =
     mentionProfile?.kind === "user"
@@ -2013,10 +2022,32 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           String(member.role || "").toLowerCase() === "owner",
       ),
   );
+  const canSwipeReply = !isActiveChannelChat || canCurrentUserEditGroup;
   const canCurrentUserViewInvite = Boolean(
     !mentionProfile &&
     (isActiveGroupChat || isActiveChannelChat) &&
       (canCurrentUserEditGroup || Boolean(Number(activeChat?.allow_member_invites || 0))),
+  );
+
+  const handleMarkChatSeen = useCallback(
+    async (chat) => {
+      const chatId = Number(chat?.id || 0);
+      if (!chatId) return;
+      setChats((prev) =>
+        prev.map((item) =>
+          Number(item.id) === chatId ? { ...item, unread_count: 0 } : item,
+        ),
+      );
+      if (Number(activeChatId || 0) === chatId) {
+        setUnreadInChat(0);
+      }
+      try {
+        await markMessagesRead({ chatId, username: user.username });
+      } catch {
+        // Keep the UI quiet for now; this menu is intentionally lightweight.
+      }
+    },
+    [activeChatId, user.username],
   );
 
   const toggleSelectChat = (chatId) => {
@@ -2031,6 +2062,106 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     if (!ids.length) return;
     setPendingDeleteIds(ids);
     setConfirmDeleteOpen(true);
+  };
+
+  const canDeleteMessageForEveryone = useCallback(
+    (message) => {
+      if (String(activeChat?.type || "").toLowerCase() === "saved") return false;
+      const messageAuthor = String(message?.username || "").toLowerCase();
+      const currentUsername = String(user?.username || "").toLowerCase();
+      if (!messageAuthor) return false;
+      if (messageAuthor === currentUsername) return true;
+      return canCurrentUserEditGroup;
+    },
+    [activeChat?.type, canCurrentUserEditGroup, user?.username],
+  );
+
+  const canEditMessageFromContext = useCallback(
+    (message) =>
+      String(message?.username || "").toLowerCase() ===
+      String(user?.username || "").toLowerCase(),
+    [user?.username],
+  );
+
+  function handleDeleteMessageRequest(message, options = {}) {
+    if (!message) return;
+    const allowDeleteForEveryone =
+      options?.allowDeleteForEveryone ?? canDeleteMessageForEveryone(message);
+    setPendingDeleteMessage(message);
+    setMessageDeleteScopeOpen(true);
+  }
+
+  async function handleForwardMessageSubmit(targetChatIds = []) {
+    const sourceMessageId = Number(
+      forwardMessageTarget?._serverId || forwardMessageTarget?.id || 0,
+    );
+    if (!sourceMessageId || !user?.username || !activeChatId) return;
+
+    const originalAuthorLabel = String(
+      forwardMessageTarget?.nickname ||
+        forwardMessageTarget?.username ||
+        user?.nickname ||
+        user?.username ||
+        "yourself",
+    ).trim();
+    const originalForwardLabel = isActiveChannelChat
+      ? String(activeChat?.name || activeFallbackTitle || "Channel").trim()
+      : originalAuthorLabel;
+
+    const body = String(forwardMessageTarget?.body || "");
+
+    try {
+      const res = await forwardMessage({
+        username: user.username,
+        sourceMessageId,
+        targetChatIds,
+        body,
+        forwardedFromChatId: isActiveChannelChat ? Number(activeChatId) : null,
+        forwardedFromLabel: originalForwardLabel,
+        forwardedFromUserId: isActiveChannelChat
+          ? null
+          : Number(forwardMessageTarget?.user_id || 0) || Number(user?.id || 0) || null,
+        forwardedFromUsername: isActiveChannelChat
+          ? ""
+          : String(
+              forwardMessageTarget?.username || user?.username || "",
+            ).trim(),
+        forwardedFromAvatarUrl: isActiveChannelChat
+          ? ""
+          : String(
+              forwardMessageTarget?.avatar_url || user?.avatarUrl || "",
+            ).trim(),
+        forwardedFromColor: isActiveChannelChat
+          ? ""
+          : String(
+              forwardMessageTarget?.color || user?.color || "#10b981",
+            ).trim(),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || "Unable to forward message.");
+      }
+      setForwardMessageTarget(null);
+      setForwardSavedChat(null);
+      await loadChats({ silent: true });
+    } catch (error) {
+      setUploadError(String(error?.message || "Unable to forward message."));
+    }
+  }
+
+  const requestLeaveGroupById = (chatId) => {
+    const id = Number(chatId || 0);
+    if (!id) return;
+    setPendingLeaveChatId(id);
+    setConfirmLeaveOpen(true);
+  };
+
+  const confirmLeaveGroupById = async () => {
+    const id = Number(pendingLeaveChatId || 0);
+    if (!id) return;
+    setConfirmLeaveOpen(false);
+    setPendingLeaveChatId(null);
+    await handleLeaveGroupById(id);
   };
 
   const confirmDeleteChats = async () => {
@@ -2347,41 +2478,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [showSettings, settingsPanel]);
 
   useEffect(() => {
-    const syncActiveState = () => {
-      setIsAppActive(
-        document.visibilityState === "visible" && document.hasFocus(),
-      );
-    };
-    syncActiveState();
-    document.addEventListener("visibilitychange", syncActiveState);
-    window.addEventListener("focus", syncActiveState);
-    window.addEventListener("blur", syncActiveState);
-    return () => {
-      document.removeEventListener("visibilitychange", syncActiveState);
-      window.removeEventListener("focus", syncActiveState);
-      window.removeEventListener("blur", syncActiveState);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!user?.username) {
-      wasAppActiveRef.current = isAppActive;
-      return;
-    }
-    const becameActive = isAppActive && !wasAppActiveRef.current;
-    wasAppActiveRef.current = isAppActive;
-    if (!becameActive) return;
-    loadChatsRef.current?.({ silent: true, showUpdating: true });
-    const activeId = Number(activeChatIdRef.current || 0);
-    if (activeId > 0) {
-      scheduleMessageRefreshRef.current?.(activeId, {
-        delayMs: 120,
-        preserveHistory: true,
-      });
-    }
-  }, [isAppActive, user?.username]);
-
-  useEffect(() => {
     const activeId = activeChatIdRef.current;
     if (
       !activeId ||
@@ -2407,6 +2503,117 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       });
   }, [messages, user?.username, isAppActive, canMarkReadInCurrentView]);
 
+  useResumeRefresh({
+    isAppActive,
+    user,
+    loadChatsRef,
+    scheduleMessageRefreshRef,
+    activeChatIdRef,
+  });
+
+  const pruneDeletedMessagesFromCache = useCallback(
+    (chatId, messageIds = []) => {
+      const numericChatId = Number(chatId || 0);
+      const deletedIds = Array.from(
+        new Set(
+          (Array.isArray(messageIds) ? messageIds : [])
+            .map((id) => Number(id))
+            .filter((id) => Number.isFinite(id) && id > 0),
+        ),
+      );
+      if (!numericChatId || !deletedIds.length) return;
+      const deletedSet = new Set(deletedIds);
+
+      const pruneCachePayload = (cached) => {
+        if (!cached || !Array.isArray(cached.messages)) {
+          return { changed: false, value: cached };
+        }
+        const nextMessages = cached.messages.filter((msg) => {
+          const serverId = Number(msg?._serverId || msg?.id || 0);
+          return !deletedSet.has(serverId);
+        });
+        if (nextMessages.length === cached.messages.length) {
+          return { changed: false, value: cached };
+        }
+        return {
+          changed: true,
+          value: {
+            ...cached,
+            messages: nextMessages,
+            lastMessageId: nextMessages.length
+              ? Number(nextMessages[nextMessages.length - 1]?.id || 0)
+              : 0,
+            updatedAt: Date.now(),
+          },
+        };
+      };
+
+      const memoryCached = readMessagesCacheMemory(
+        messagesCacheRef.current,
+        numericChatId,
+      );
+      const nextMemory = pruneCachePayload(memoryCached);
+      if (nextMemory.changed) {
+        writeMessagesCacheMemory(
+          messagesCacheRef.current,
+          numericChatId,
+          nextMemory.value,
+          activeChatIdRef.current,
+        );
+      }
+
+      if (!user?.username || !canUseIdb()) return;
+      const key = buildMessagesCacheKey(user.username, numericChatId);
+      void (async () => {
+        const idbCached = await readMessagesCacheAsync(user.username, numericChatId);
+        const nextIdb = pruneCachePayload(idbCached);
+        if (!nextIdb.changed) return;
+        await writeIdbCache(CACHE_STORES.messages, key, nextIdb.value);
+        await updateMessagesIndex(
+          user.username,
+          numericChatId,
+          Number(nextIdb.value?.updatedAt || Date.now()),
+        );
+      })();
+    },
+    [user?.username],
+  );
+
+  function applyDeletedMessageLocally(messageId) {
+    const numericMessageId = Number(messageId || 0);
+    if (!numericMessageId) return;
+    setMessages((prev) =>
+      prev.filter((msg) => Number(msg?._serverId || msg?.id || 0) !== numericMessageId),
+    );
+    if (activeChatId) {
+      pruneDeletedMessagesFromCache(activeChatId, [numericMessageId]);
+    }
+  }
+
+  async function performDeleteMessage(message, scope = "self") {
+    const messageId = Number(message?.id || message?._serverId || 0);
+    if (!activeChatId || !messageId || !user?.username) return;
+    try {
+      const res = await deleteMessage({
+        chatId: Number(activeChatId),
+        username: user.username,
+        messageId,
+        scope,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || "Unable to delete message.");
+      }
+      applyDeletedMessageLocally(messageId);
+      await loadChats({ silent: true });
+    } catch (error) {
+      setUploadError(String(error?.message || "Unable to delete message."));
+    } finally {
+      setMessageDeleteScopeOpen(false);
+      setPendingDeleteMessage(null);
+    }
+  }
+
   useChatEvents({
     username: user?.username,
     getSseStreamUrl,
@@ -2424,14 +2631,18 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     setChats,
     sseReconnectRef,
     onIncomingMessage: (payload, meta = {}) => {
+      const payloadChatId = Number(payload?.chatId || 0);
+      const sender = String(payload?.username || "").trim().toLowerCase();
+      if (payloadChatId && sender) {
+        clearTypingExpiryTimer(payloadChatId, sender);
+        removeTypingUser(payloadChatId, sender);
+      }
       if (typeof window === "undefined" || !("Notification" in window)) return;
       if (!notificationsActive) return;
-      const sender = String(payload?.username || "").trim();
+      const senderName = String(payload?.username || "").trim();
       const isOwnEvent =
-        sender.toLowerCase() === String(user?.username || "").toLowerCase();
+        senderName.toLowerCase() === String(user?.username || "").toLowerCase();
       if (isOwnEvent) return;
-      const payloadChatId = Number(payload?.chatId || 0);
-      const currentActiveId = activeChatIdRef.current;
       const appVisible =
         document.visibilityState === "visible" && document.hasFocus();
       if (appVisible) {
@@ -2446,11 +2657,29 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
             (member) => member.username !== user?.username,
           );
           title = other?.nickname || other?.username || "Deleted account";
+        } else if (chat.type === "group") {
+          const groupName = chat.name || "Group";
+          const senderLabel = senderName
+            ? (() => {
+                const senderMember = (chat.members || []).find(
+                  (member) =>
+                    String(member?.username || "").toLowerCase() ===
+                    String(senderName || "").toLowerCase(),
+                );
+                return (
+                  senderMember?.nickname ||
+                  senderMember?.username ||
+                  String(payload?.nickname || "").trim() ||
+                  senderName
+                );
+              })()
+            : "";
+          title = senderLabel ? `${groupName} (${senderLabel})` : groupName;
         } else {
           title = chat.name || "Chat";
         }
-      } else if (sender) {
-        title = sender;
+      } else if (senderName) {
+        title = senderName;
       }
       const messageBody = normalizeMessageBody(meta?.body ?? payload?.body).trim();
       const summaryText = String(payload?.summaryText || "").trim();
@@ -2465,8 +2694,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
             : messageBody;
         const body = baseBody
           ? truncateText(baseBody, NOTIFICATION_PREVIEW_MAX_CHARS)
-          : sender
-            ? `New message from ${sender}.`
+          : senderName
+            ? `New message from ${senderName}.`
             : "New message.";
       try {
         const notification = new Notification(title, {
@@ -2480,6 +2709,13 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       } catch {
         // ignore notification errors
       }
+    },
+    onMessageDeleted: (payload) => {
+      const payloadChatId = Number(payload?.chatId || 0);
+      const messageIds = Array.isArray(payload?.messageIds)
+        ? payload.messageIds
+        : [];
+      pruneDeletedMessagesFromCache(payloadChatId, messageIds);
     },
     onChatRead: (payload) => {
       const payloadChatId = Number(payload?.chatId || 0);
@@ -2497,14 +2733,44 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     onPresenceUpdate: (payload) => {
       applyPresenceUpdate(payload);
     },
+    onTypingUpdate: (payload) => {
+      const payloadChatId = Number(payload?.chatId || 0);
+      const sender = String(payload?.username || "").toLowerCase();
+      if (!payloadChatId || !sender) return;
+      if (sender === String(user?.username || "").toLowerCase()) return;
+      const chat = chats.find((item) => Number(item?.id) === payloadChatId);
+      if (String(chat?.type || "").toLowerCase() === "channel") {
+        clearTypingExpiryTimer(payloadChatId, sender);
+        removeTypingUser(payloadChatId, sender);
+        return;
+      }
+      const isTyping = Boolean(payload?.isTyping);
+      if (!isTyping) {
+        clearTypingExpiryTimer(payloadChatId, sender);
+        removeTypingUser(payloadChatId, sender);
+        return;
+      }
+      setTypingUser(payloadChatId, sender, payload?.nickname || payload?.username || sender);
+      scheduleTypingExpiry(payloadChatId, sender);
+    },
     onChatListChanged: (payload) => {
       const deletedChatId = Number(payload?.chatId || 0);
       const currentActiveId = Number(activeChatIdRef.current || 0);
-      setMentionRefreshToken((prev) => prev + 1);
+      if (deletedChatId) {
+        setTypingByChat((prev) => {
+          if (!prev?.[deletedChatId]) return prev;
+          const next = { ...prev };
+          delete next[deletedChatId];
+          return next;
+        });
+      }
       // If the deleted/changed chat is the active one, close it
       if (deletedChatId && deletedChatId === currentActiveId) {
         closeChat();
       }
+    },
+    onSessionRevoked: () => {
+      handleLogout();
     },
   });
 
@@ -2512,73 +2778,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     loadChatsRef.current = loadChats;
     scheduleMessageRefreshRef.current = scheduleMessageRefresh;
   });
-
-  useEffect(() => {
-    if (typeof navigator === "undefined") return;
-    if (!("serviceWorker" in navigator)) return;
-    navigator.serviceWorker.ready
-      .then((reg) => {
-        pushRegistrationRef.current = reg;
-        setPushSwReady(true);
-      })
-      .catch(() => null);
-  }, []);
-
-  useEffect(() => {
-    if (!notificationsModalOpen && settingsPanel !== "notifications") return;
-    if (typeof window === "undefined") return;
-    let active = true;
-    fetchPushPublicKey()
-      .then((res) => res.json())
-      .then((data) => {
-        if (!active) return;
-        const key = data?.publicKey ? String(data.publicKey) : "";
-        setPushVapidReady(Boolean(key));
-        setPushVapidLength(key ? getVapidKeyLength(key) : 0);
-      })
-      .catch(() => {
-        if (!active) return;
-        setPushVapidReady(false);
-        setPushVapidLength(0);
-      });
-    return () => {
-      active = false;
-    };
-  }, [notificationsModalOpen, settingsPanel]);
-
-  useEffect(() => {
-    if (!notificationsEnabled) return;
-    if (notificationPermission !== "granted") return;
-    ensurePushSubscription();
-  }, [notificationsEnabled, notificationPermission]);
-
-  useEffect(() => {
-    if (!notificationsEnabled) return;
-    if (notificationPermission !== "granted") return;
-    if (typeof window === "undefined") return;
-    const timer = window.setInterval(() => {
-      void maybeRefreshPushSubscription("interval");
-    }, PUSH_REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [notificationsEnabled, notificationPermission]);
-
-  useEffect(() => {
-    if (typeof document === "undefined" || typeof window === "undefined") return;
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") {
-        void maybeRefreshPushSubscription("resume");
-      }
-    };
-    const handleFocus = () => {
-      void maybeRefreshPushSubscription("focus");
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-    window.addEventListener("focus", handleFocus);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibility);
-      window.removeEventListener("focus", handleFocus);
-    };
-  }, [notificationsEnabled, notificationPermission, notificationsSupported]);
 
   const uploadPendingMessageWithProgress = (pendingMessage, targetChatId) =>
     new Promise((resolve, reject) => {
@@ -2589,6 +2788,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       form.append("uploadType", pendingMessage._uploadType || "document");
       if (pendingMessage.replyTo?.id) {
         form.append("replyToMessageId", String(pendingMessage.replyTo.id));
+      }
+      if (pendingMessage._editMessageId) {
+        form.append("editMessageId", String(pendingMessage._editMessageId));
       }
       const fileMeta = [];
       pendingMessage._files.forEach((item) => {
@@ -2657,6 +2859,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
     const clientId = pendingMessage._clientId;
     const hasFiles = Array.isArray(pendingMessage._files) && pendingMessage._files.length > 0;
+    const isEditingExistingMessage = Number(pendingMessage?._editMessageId || 0) > 0;
     if (!clientId || sendingClientIdsRef.current.has(clientId)) return;
 
     const maxMessageChars = APP_CONFIG.messageMaxChars;
@@ -2688,16 +2891,39 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         }
         data = await uploadPendingMessageWithProgress(pendingMessage, targetChatId);
       } else {
-        const res = await sendMessage({
-          username: user.username,
-          body: pendingMessage.body,
-          chatId: targetChatId,
-          replyToMessageId: pendingMessage.replyTo?.id || null,
-        });
+        const res = isEditingExistingMessage
+          ? await editMessage({
+              username: user.username,
+              body: pendingMessage.body,
+              chatId: targetChatId,
+              messageId: pendingMessage._editMessageId,
+            })
+          : await sendMessage({
+              username: user.username,
+              body: pendingMessage.body,
+              chatId: targetChatId,
+              replyToMessageId: pendingMessage.replyTo?.id || null,
+            });
         data = await res.json();
         if (!res.ok) {
           throw new Error(data?.error || "Unable to send message.");
         }
+      }
+
+      if (isEditingExistingMessage) {
+        if (hasFiles && isTargetActive) {
+          setActiveUploadProgress(100);
+          setTimeout(() => setActiveUploadProgress(null), UPLOAD_PROGRESS_HIDE_DELAY_MS);
+        }
+        if (isTargetActive) {
+          scheduleMessageRefreshRef.current?.(targetChatId, {
+            preserveHistory: true,
+            pruneMissing: true,
+          });
+        }
+        await loadChats({ silent: true });
+        setEditTarget(null);
+        return;
       }
 
       if (isTargetActive) {
@@ -2709,6 +2935,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           );
           const keepPendingUntilServerEcho = hasFiles && uploadType === "media" && hasMediaVideo;
           const serverId = Number(data.id) || null;
+          const awaitingServerEcho = Boolean(serverId);
           const index = prev.findIndex((msg) => msg?._clientId === clientId);
           if (index >= 0) {
             return prev.map((msg) =>
@@ -2719,8 +2946,12 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
                     _delivery: keepPendingUntilServerEcho ? "sending" : "sent",
                     _processingPending:
                       keepPendingUntilServerEcho || Boolean(msg?._processingPending),
-                    _awaitingServerEcho: true,
+                    _awaitingServerEcho: awaitingServerEcho,
                     _uploadProgress: 100,
+                    expiresAt:
+                      hasFiles
+                        ? msg.expiresAt
+                        : data?.expiresAt || msg.expiresAt || null,
                     read_at:
                       isSavedChat && !msg.read_at
                         ? msg.created_at || new Date().toISOString()
@@ -2736,7 +2967,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           const createdAt = pendingMessage?._createdAt || new Date().toISOString();
           const pendingDate = parseServerDate(createdAt);
           const pendingDayKey = `${pendingDate.getFullYear()}-${pendingDate.getMonth()}-${pendingDate.getDate()}`;
-          const pendingBody = String(pendingMessage?.body || "").trim() || "Sent a file";
+          const pendingBody = String(pendingMessage?.body || "").trim();
           const messageFiles = files.map((file) => ({
             id: file.id,
             _localId: file._localId || file.id,
@@ -2773,9 +3004,10 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
               _uploadType: uploadType || "document",
               _files: files,
               _uploadProgress: 100,
-              _awaitingServerEcho: true,
+              _awaitingServerEcho: awaitingServerEcho,
               _processingPending: keepPendingUntilServerEcho,
               _serverId: serverId,
+              expiresAt: hasFiles ? null : data?.expiresAt || null,
               replyTo: pendingMessage.replyTo || null,
               files: messageFiles,
             },
@@ -2789,9 +3021,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         }
       }
       pendingScrollToBottomRef.current = false;
-      await loadChats({ silent: true });
-      // Keep optimistic row stable and rely on SSE/polling for server echo.
-      // Immediate forced refetch here can race and cause first-message flicker.
+      // Keep optimistic row stable and let SSE/polling reconcile the final server row.
+      // Avoid forcing a full sidebar refresh on every successful send.
     } catch (error) {
       if (hasFiles) {
         if (isTargetActive) {
@@ -2859,7 +3090,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [activeChatId]);
 
   useEffect(() => {
-    if (!activeChatId) return;
+    if (!activeChatId || !isAppActive) return;
     const interval = setInterval(() => {
       const pending = messages.filter(
         (msg) => msg._delivery === "sending" && !msg._awaitingServerEcho,
@@ -2870,10 +3101,10 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       });
     }, CHAT_PAGE_CONFIG.pendingRetryIntervalMs);
     return () => clearInterval(interval);
-  }, [activeChatId, messages]);
+  }, [activeChatId, messages, isAppActive]);
 
   useEffect(() => {
-    if (!activeChatId) return;
+    if (!activeChatId || !isAppActive) return;
     const needsMediaSync = messages.some((msg) => {
       const isOwn = msg.username === user.username;
       if (!isOwn) return false;
@@ -2885,11 +3116,13 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       return false;
     });
     if (!needsMediaSync) return;
+    const backoff = getNetworkBackoffMultiplier();
+    const mediaSyncIntervalMs = Math.max(2000, Math.round(2500 * backoff));
     const interval = setInterval(() => {
       void loadMessages(activeChatId, { silent: true, preserveHistory: true });
-    }, 2500);
+    }, mediaSyncIntervalMs);
     return () => clearInterval(interval);
-  }, [activeChatId, messages, user.username, isMobileViewport, sseConnected]);
+  }, [activeChatId, messages, user.username, isMobileViewport, sseConnected, isAppActive]);
 
   useEffect(() => {
     if (!activeChatId) return;
@@ -2901,8 +3134,13 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       lastMessageId: messages.length ? Number(messages[messages.length - 1]?.id || 0) : 0,
       updatedAt: Date.now(),
     };
-    messagesCacheRef.current.set(Number(activeChatId), cachePayload);
-    if (user?.username && canUseLocalStorage()) {
+    writeMessagesCacheMemory(
+      messagesCacheRef.current,
+      Number(activeChatId),
+      cachePayload,
+      activeChatIdRef.current,
+    );
+    if (user?.username) {
       const storagePayload = {
         ...cachePayload,
         messages: sanitizeMessagesForCache(messages),
@@ -2912,15 +3150,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       }
       messagesCacheWriteTimerRef.current = setTimeout(() => {
         const key = buildMessagesCacheKey(user.username, activeChatId);
-        let ok = writeLocalCache(key, storagePayload);
-        if (!ok) {
-          evictOldestMessageCaches(user.username, 4);
-          ok = writeLocalCache(key, storagePayload);
-        }
-        if (ok) {
-          updateMessagesIndex(user.username, activeChatId, cachePayload.updatedAt);
-        }
         void writeIdbCache(CACHE_STORES.messages, key, storagePayload);
+        void updateMessagesIndex(user.username, activeChatId, cachePayload.updatedAt);
       }, 600);
     }
     return () => {
@@ -2940,6 +3171,29 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   }, [settingsPanel, profileError, passwordError]);
 
   async function loadChats(options = {}) {
+    if (loadChatsInFlightRef.current) {
+      const queued = {
+        silent: Boolean(options.silent),
+        showUpdating: Boolean(options.showUpdating),
+      };
+      if (queuedLoadChatsOptionsRef.current) {
+        queuedLoadChatsOptionsRef.current = {
+          silent:
+            queuedLoadChatsOptionsRef.current.silent && queued.silent,
+          showUpdating:
+            queuedLoadChatsOptionsRef.current.showUpdating || queued.showUpdating,
+        };
+      } else {
+        queuedLoadChatsOptionsRef.current = queued;
+      }
+      return;
+    }
+    loadChatsInFlightRef.current = true;
+    if (loadChatsAbortRef.current) {
+      loadChatsAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    loadChatsAbortRef.current = controller;
     const showUpdating = Boolean(options.showUpdating);
     if (!options.silent) {
       setLoadingChats(true);
@@ -2948,7 +3202,10 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       setIsUpdatingChats(true);
     }
     try {
-      const res = await listChatsForUser(user.username, { cache: "no-store" });
+      const res = await listChatsForUser(user.username, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data?.error || "Failed to load chats.");
@@ -2956,7 +3213,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       const list = (data.chats || []).map((conv) => ({
         ...conv,
         id: Number(conv.id),
-        message_count: Number(conv.message_count || 0),
         last_message: normalizeMessageBody(conv.last_message),
         members: (conv.members || []).map((member) => ({
           ...member,
@@ -2988,10 +3244,10 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           dmByPeer.set(peerKey, chat);
           return;
         }
-        const existingCount = Number(existing.message_count || 0);
-        const nextCount = Number(chat.message_count || 0);
-        if (nextCount !== existingCount) {
-          if (nextCount > existingCount) {
+        const existingLastMessageId = Number(existing.last_message_id || 0);
+        const nextLastMessageId = Number(chat.last_message_id || 0);
+        if (nextLastMessageId !== existingLastMessageId) {
+          if (nextLastMessageId > existingLastMessageId) {
             dmByPeer.set(peerKey, chat);
           }
           return;
@@ -3071,7 +3327,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         updatedAt: Date.now(),
         chats: normalizedPatched,
       };
-      writeLocalCache(buildChatListCacheKey(user.username), chatListPayload);
       void writeIdbCache(
         CACHE_STORES.chatList,
         buildChatListCacheKey(user.username),
@@ -3099,554 +3354,30 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
           window.sessionStorage.removeItem(OPEN_CHAT_ID_KEY);
         }
       }
-    } catch {
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        return;
+      }
       // Keep sidebar usable even when polling fails.
     } finally {
+      if (loadChatsAbortRef.current === controller) {
+        loadChatsAbortRef.current = null;
+      }
+      loadChatsInFlightRef.current = false;
+      const queued = queuedLoadChatsOptionsRef.current;
+      queuedLoadChatsOptionsRef.current = null;
       if (!options.silent) {
         setLoadingChats(false);
       }
       if (showUpdating) {
         setIsUpdatingChats(false);
       }
-    }
-  }
-
-  async function loadMessages(chatId, options = {}) {
-    const requestChatId = Number(chatId);
-    if (!options.silent) {
-      setLoadingMessages(true);
-    }
-    if (
-      messageFetchInFlightRef.current &&
-      options.silent &&
-      options.preserveHistory &&
-      !options.prepend
-    ) {
-      queuedSilentMessageRefreshRef.current = {
-        chatId: Number(chatId),
-        options: { ...options, silent: true, preserveHistory: true },
-      };
-      return;
-    }
-    messageFetchInFlightRef.current = true;
-    try {
-      const fetchLimit = Number(options.limit || CHAT_PAGE_CONFIG.messageFetchLimit);
-      const query = new URLSearchParams({
-        chatId: String(chatId),
-        username: user.username,
-        limit: String(fetchLimit),
-      });
-      if (options.beforeId) {
-        query.set("beforeId", String(options.beforeId));
-      }
-      if (options.beforeCreatedAt) {
-        query.set("beforeCreatedAt", String(options.beforeCreatedAt));
-      }
-      const res = await listMessagesByQuery(
-        Object.fromEntries(query.entries()),
-        { cache: "no-store" },
-      );
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || "Failed to load messages.");
-      }
-      if (activeChatIdRef.current !== requestChatId) {
-        return;
-      }
-      setHasOlderMessages((prev) =>
-        options.prepend
-          ? Boolean(data?.hasMore)
-          : options.preserveHistory
-            ? prev || Boolean(data?.hasMore)
-            : Boolean(data?.hasMore),
-      );
-      const chatType =
-        chats.find((chat) => Number(chat.id) === Number(requestChatId))?.type ||
-        activeChatTypeRef.current ||
-        null;
-      const allowSystemEvents = String(chatType || "").toLowerCase() !== "channel";
-      const nextMessages = (data.messages || []).map((msg) => {
-        const date = parseServerDate(msg.created_at);
-        const dayKey = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
-        const readByMe =
-          Number(msg?.user_id || 0) === Number(user.id) || Boolean(msg.read_by_me);
-        const hasProcessingVideo = Array.isArray(msg?.files)
-          ? msg.files.some(
-              (file) =>
-                String(file?.mimeType || "").toLowerCase().startsWith("video/") &&
-                file?.processing === true &&
-                !String(file?.url || "").includes("-h264-"),
-            )
-          : false;
-        const isOwnProcessingVideo = hasProcessingVideo && msg.username === user.username;
-        const normalizedBody = normalizeMessageBody(msg?.body);
-        const normalizedReply =
-          msg?.replyTo && typeof msg.replyTo === "object"
-            ? {
-                ...msg.replyTo,
-                body: normalizeMessageBody(msg.replyTo?.body),
-              }
-            : msg?.replyTo || null;
-        const bodyText = normalizedBody;
-        const systemMatch = bodyText.match(/^\[\[system:(join|joined|left|removed):(.+)\]\]$/i);
-        const rawTargetName = systemMatch?.[2] ? String(systemMatch[2]).trim() : "";
-        const maxNameLength = 13;
-        const shortTargetName =
-          rawTargetName.length > maxNameLength
-            ? `${rawTargetName.slice(0, maxNameLength)}...`
-            : rawTargetName;
-        const normalizedSystemType = String(systemMatch?.[1] || "").toLowerCase();
-        const systemText =
-          normalizedSystemType === "left"
-            ? `${shortTargetName || "A member"} left the group`
-            : normalizedSystemType === "removed"
-              ? `${shortTargetName || "A member"} was removed from the group`
-              : normalizedSystemType
-                ? `${shortTargetName || "A member"} joined the group`
-                : "";
-        return {
-          ...msg,
-          body: normalizedBody,
-          replyTo: normalizedReply,
-          _readByMe: readByMe,
-          _dayKey: dayKey,
-          _dayLabel: formatDayLabel(msg.created_at),
-          _timeLabel: formatTime(msg.created_at),
-          _processingPending: isOwnProcessingVideo,
-          _systemEvent:
-            allowSystemEvents && normalizedSystemType
-              ? { type: normalizedSystemType, text: systemText }
-              : null,
-        };
-      });
-      const replyIconByMessageId = new Map(
-        nextMessages
-          .map((message) => [Number(message?.id || 0), resolveReplyPreview(message).icon || null])
-          .filter(([id, icon]) => Number.isFinite(id) && id > 0 && Boolean(icon)),
-      );
-      const replyColorByMessageId = new Map(
-        nextMessages
-          .map((message) => [Number(message?.id || 0), message?.color || null])
-          .filter(([id, color]) => Number.isFinite(id) && id > 0 && Boolean(color)),
-      );
-      const nextMessagesWithReplyIcons = nextMessages.map((message) => {
-        if (!message?.replyTo) return message;
-        const replyId = Number(message.replyTo.id || 0);
-        if (!replyId) return message;
-        const resolvedIcon = replyIconByMessageId.get(replyId) || null;
-        const resolvedColor = replyColorByMessageId.get(replyId) || null;
-        if (!resolvedIcon && !resolvedColor) return message;
-        return {
-          ...message,
-          replyTo: {
-            ...message.replyTo,
-            icon: resolvedIcon || message.replyTo.icon || null,
-            color: resolvedColor || message.replyTo.color || null,
-          },
-        };
-      });
-      if (options.prepend) {
-        setMessages((prev) => {
-          if (activeChatIdRef.current !== requestChatId) return prev;
-          const seen = new Set(prev.map((msg) => Number(msg.id)));
-          const older = nextMessagesWithReplyIcons.filter((msg) => !seen.has(Number(msg.id)));
-          return older.length ? [...older, ...prev] : prev;
-        });
-        return;
-      }
-      setMessages((prev) => {
-        if (activeChatIdRef.current !== requestChatId) return prev;
-        if (isActiveChannelChat) {
-          const nextCounts = nextMessagesWithReplyIcons.reduce((acc, msg) => {
-            const id = Number(msg?.id || 0);
-            if (!id) return acc;
-            if (Number.isFinite(Number(msg?.seenCount))) {
-              acc[id] = Math.max(1, Number(msg.seenCount));
-            }
-            return acc;
-          }, {});
-          if (Object.keys(nextCounts).length) {
-            setChannelSeenCounts((prevCounts) => ({ ...prevCounts, ...nextCounts }));
-          }
-        }
-        let basePrev = prev;
-        if (options.pruneMissing) {
-          const serverIds = new Set(
-            nextMessagesWithReplyIcons
-              .map((msg) => Number(msg?.id || 0))
-              .filter((id) => Number.isFinite(id) && id > 0),
-          );
-          basePrev = prev.filter((msg) => {
-            if (msg?._delivery === "sending" || msg?._delivery === "failed") return true;
-            if (msg?._clientId) return true;
-            const serverId = Number(msg?._serverId || msg?.id || 0);
-            return serverIds.has(serverId);
-          });
-        }
-        const prevLatestVisibleTime = basePrev.reduce((max, msg) => {
-          const t = Number(msg?._visibilityTime || parseServerDate(msg?.created_at).getTime());
-          return Number.isFinite(t) ? Math.max(max, t) : max;
-        }, 0);
-        const prevByServerId = new Map(
-          basePrev
-            .filter((msg) => Number.isFinite(Number(msg._serverId || msg.id)))
-            .map((msg) => [Number(msg._serverId || msg.id), msg]),
-        );
-        const prevLocalCandidates = basePrev.filter((msg) => Boolean(msg?._clientId));
-        const nextMessagesWithLocalIdentity = nextMessagesWithReplyIcons.map((serverMsg) => {
-          let existingLocal = prevByServerId.get(Number(serverMsg.id));
-          if (!existingLocal) {
-            existingLocal = prevLocalCandidates.find((localMsg) => {
-              if (!localMsg?._clientId) return false;
-              if ((localMsg.username || "") !== (serverMsg.username || "")) return false;
-              if ((localMsg.body || "") !== (serverMsg.body || "")) return false;
-              const localFiles = Array.isArray(localMsg.files) ? localMsg.files : [];
-              const serverFiles = Array.isArray(serverMsg.files) ? serverMsg.files : [];
-              if (localFiles.length !== serverFiles.length) return false;
-              const localTime = parseServerDate(localMsg.created_at).getTime();
-              const serverTime = parseServerDate(serverMsg.created_at).getTime();
-              return Math.abs(localTime - serverTime) < 2 * 60 * 1000;
-            });
-          }
-          if (!existingLocal?._clientId) return serverMsg;
-          const serverFiles = Array.isArray(serverMsg.files) ? serverMsg.files : [];
-          const localFiles = Array.isArray(existingLocal.files) ? existingLocal.files : [];
-          const mergedFiles =
-            serverFiles.length && localFiles.length === serverFiles.length
-              ? serverFiles.map((file, idx) => ({
-                  ...file,
-                  _localId: localFiles[idx]?._localId || localFiles[idx]?.id || null,
-                  _localUrl: localFiles[idx]?.url || localFiles[idx]?._localUrl || null,
-                }))
-              : serverFiles;
-          return {
-            ...serverMsg,
-            files: mergedFiles,
-            _clientId: existingLocal._clientId,
-            _serverId: Number(serverMsg.id),
-            _chatId: existingLocal._chatId,
-            _delivery: undefined,
-            _awaitingServerEcho: false,
-            _visibilityTime: existingLocal?._visibilityTime,
-          };
-        });
-        const nextMessagesWithVisibility = nextMessagesWithLocalIdentity.map((serverMsg) => {
-          if (serverMsg?._visibilityTime) return serverMsg;
-          const hasVideo = Array.isArray(serverMsg?.files)
-            ? serverMsg.files.some((file) =>
-                String(file?.mimeType || "").toLowerCase().startsWith("video/"),
-              )
-            : false;
-          const isFromOther = String(serverMsg?.username || "") !== String(user.username || "");
-          const createdAtMs = parseServerDate(serverMsg?.created_at).getTime();
-          const revealedLate =
-            isFromOther &&
-            hasVideo &&
-            Number.isFinite(createdAtMs) &&
-            prevLatestVisibleTime > 0 &&
-            createdAtMs < prevLatestVisibleTime;
-          if (!revealedLate) return serverMsg;
-          return {
-            ...serverMsg,
-            _visibilityTime: Date.now(),
-          };
-        });
-
-        if (
-          nextMessages.length === 0 &&
-          basePrev.some((msg) => {
-            if (Number(msg._chatId || chatId) !== Number(chatId)) return false;
-            return Boolean(
-              msg._clientId || msg._awaitingServerEcho || msg._delivery,
-            );
-          })
-        ) {
-          // Prevent one-frame disappearance when first local message exists
-          // and a transient fetch returns empty before server echo settles.
-          return basePrev;
-        }
-        const isPendingMessageAcknowledged = (pending, serverMessages) => {
-          if (!pending || !serverMessages.length) return false;
-          const pendingHasFiles = Array.isArray(pending.files) && pending.files.length > 0;
-          const pendingProgress = Number(pending._uploadProgress ?? 100);
-          if (
-            pending._delivery === "sending" &&
-            pendingHasFiles &&
-            pendingProgress < 100
-          ) {
-            return false;
-          }
-          const pendingCreatedAt = parseServerDate(
-            pending.created_at || new Date().toISOString(),
-          ).getTime();
-          const pendingFiles = Array.isArray(pending.files) ? pending.files : [];
-          return serverMessages.some((serverMsg) => {
-            if (serverMsg.username !== pending.username) return false;
-            if ((serverMsg.body || "") !== (pending.body || "")) return false;
-            const serverFiles = Array.isArray(serverMsg.files) ? serverMsg.files : [];
-            if (serverFiles.length !== pendingFiles.length) return false;
-            const serverCreatedAt = parseServerDate(serverMsg.created_at).getTime();
-            const minMatchTime = pendingCreatedAt - 3000;
-            const maxMatchTime = pendingCreatedAt + 2 * 60 * 1000;
-            return serverCreatedAt >= minMatchTime && serverCreatedAt <= maxMatchTime;
-          });
-        };
-
-        const isServerMessageShadowedByPendingUpload = (
-          serverMsg,
-          pendingMessages,
-        ) => {
-          return pendingMessages.some((pending) => {
-            if (!pending || pending._delivery !== "sending") return false;
-            const pendingFiles = Array.isArray(pending.files) ? pending.files : [];
-            if (!pendingFiles.length) return false;
-            const pendingProgress = Number(pending._uploadProgress || 0);
-            if (pendingProgress >= 100) return false;
-            if (serverMsg.username !== pending.username) return false;
-            if ((serverMsg.body || "") !== (pending.body || "")) return false;
-            const serverFiles = Array.isArray(serverMsg.files) ? serverMsg.files : [];
-            if (serverFiles.length !== pendingFiles.length) return false;
-            const pendingCreatedAt = parseServerDate(
-              pending.created_at || new Date().toISOString(),
-            ).getTime();
-            const serverCreatedAt = parseServerDate(serverMsg.created_at).getTime();
-            const minMatchTime = pendingCreatedAt - 3000;
-            const maxMatchTime = pendingCreatedAt + 2 * 60 * 1000;
-            return serverCreatedAt >= minMatchTime && serverCreatedAt <= maxMatchTime;
-          });
-        };
-
-        const pendingLocal = basePrev.filter(
-          (msg) =>
-            (msg._delivery === "sending" || msg._delivery === "failed") &&
-            Number(msg._chatId || chatId) === Number(chatId) &&
-            !isPendingMessageAcknowledged(msg, nextMessages),
-        );
-        const optimisticSentLocal = basePrev.filter((msg) => {
-          if (!msg?._awaitingServerEcho) return false;
-          if (Number(msg._chatId || chatId) !== Number(chatId)) return false;
-          return !nextMessagesWithVisibility.some(
-            (serverMsg) =>
-              Number(serverMsg.id) === Number(msg._serverId || msg.id),
-          );
-        });
-        const nextMessagesVisible = nextMessagesWithVisibility.filter(
-          (msg) => !isServerMessageShadowedByPendingUpload(msg, pendingLocal),
-        );
-        const compareMessages = (left, right) => {
-          const leftIsPending =
-            left?._delivery === "sending" || Boolean(left?._processingPending);
-          const rightIsPending =
-            right?._delivery === "sending" || Boolean(right?._processingPending);
-          if (leftIsPending !== rightIsPending) {
-            return leftIsPending ? 1 : -1;
-          }
-          if (leftIsPending && rightIsPending) {
-            const leftQueuedAt = Number(left?._queuedAt || 0);
-            const rightQueuedAt = Number(right?._queuedAt || 0);
-            if (leftQueuedAt !== rightQueuedAt) {
-              return leftQueuedAt - rightQueuedAt;
-            }
-          }
-          const leftServerId = Number(left?._serverId || left?.id);
-          const rightServerId = Number(right?._serverId || right?.id);
-          const leftHasServerId = Number.isFinite(leftServerId) && leftServerId > 0;
-          const rightHasServerId = Number.isFinite(rightServerId) && rightServerId > 0;
-          if (leftHasServerId && rightHasServerId) {
-            return leftServerId - rightServerId;
-          }
-          const leftTime = Number(left?._visibilityTime || parseServerDate(left?.created_at).getTime());
-          const rightTime = Number(right?._visibilityTime || parseServerDate(right?.created_at).getTime());
-          if (leftTime !== rightTime) {
-            return leftTime - rightTime;
-          }
-          const leftId = Number(left?.id);
-          const rightId = Number(right?.id);
-          const leftHasNumericId = Number.isFinite(leftId);
-          const rightHasNumericId = Number.isFinite(rightId);
-          if (leftHasNumericId && rightHasNumericId) {
-            return leftId - rightId;
-          }
-          return String(left?._clientId || "").localeCompare(String(right?._clientId || ""));
-        };
-
-        let mergedNext = [
-          ...nextMessagesVisible,
-          ...optimisticSentLocal,
-          ...pendingLocal,
-        ].sort(compareMessages);
-
-        const nowMs = Date.now();
-        const rescuedOptimistic = basePrev.filter((msg) => {
-          if (!msg?._clientId) return false;
-          if (Number(msg._chatId || chatId) !== Number(chatId)) return false;
-          const queuedAt = Number(msg?._queuedAt || 0);
-          if (!queuedAt || nowMs - queuedAt > 2 * 60 * 1000) return false;
-          const hasClientMatch = mergedNext.some(
-            (item) => String(item?._clientId || "") === String(msg._clientId),
-          );
-          if (hasClientMatch) return false;
-          const optimisticServerId = Number(msg?._serverId || 0);
-          if (optimisticServerId) {
-            const hasServerMatch = mergedNext.some(
-              (item) => Number(item?._serverId || item?.id || 0) === optimisticServerId,
-            );
-            if (hasServerMatch) return false;
-          }
-          return true;
-        });
-        if (rescuedOptimistic.length) {
-          mergedNext = [...mergedNext, ...rescuedOptimistic].sort(compareMessages);
-        }
-
-        if (options.preserveHistory) {
-          const mergedById = new Map();
-          mergedNext.forEach((msg) => {
-            const key = Number(msg?._serverId || msg?.id);
-            if (Number.isFinite(key)) {
-              mergedById.set(key, msg);
-            }
-          });
-          const carriedOlder = prev.filter((msg) => {
-            const key = Number(msg?._serverId || msg?.id);
-            if (!Number.isFinite(key)) return false;
-            return !mergedById.has(key);
-          });
-          if (carriedOlder.length) {
-            mergedNext = [...carriedOlder, ...mergedNext].sort(compareMessages);
-          }
-        }
-        return mergedNext;
-      });
-      const lastMsg = nextMessages[nextMessages.length - 1];
-      const lastId = lastMsg?.id || null;
-      const hasUnreadFromOthers = nextMessages.some(
-        (msg) => msg.username !== user.username && !msg._readByMe,
-      );
-      const hasNew =
-        lastId &&
-        lastMessageIdRef.current &&
-        lastId !== lastMessageIdRef.current;
-      const newFromSelf = hasNew && lastMsg?.username === user.username;
-      lastMessageIdRef.current = lastId;
-
-      if (openingChatRef.current) {
-        const firstUnreadIndex = nextMessages.findIndex(
-          (msg) => msg.username !== user.username && !msg._readByMe,
-        );
-        const firstUnreadMessage =
-          firstUnreadIndex >= 0 ? nextMessages[firstUnreadIndex] : null;
-
-        shouldAutoMarkReadRef.current = true;
-        pendingScrollToUnreadRef.current = null;
-
-        if (!firstUnreadMessage?.id && openingUnreadCountRef.current > 0 && !options.forceUnreadFetch) {
-          const boostedLimit = Math.min(
-            CHAT_PAGE_CONFIG.messageFetchLimit,
-            Math.max(
-              CHAT_PAGE_CONFIG.messageFetchLimit,
-              Number(openingUnreadCountRef.current || 0) + 200,
-              Number(options.limit || 0) + 200,
-            ),
-          );
-          void loadMessages(chatId, {
-            silent: true,
-            preserveHistory: true,
-            limit: boostedLimit,
-            forceUnreadFetch: true,
-          });
-          return;
-        }
-
-        if (firstUnreadMessage?.id) {
-          shouldAutoMarkReadRef.current = false;
-          const unreadId = Number(firstUnreadMessage.id);
-          setUnreadMarkerId(unreadId);
-          unreadMarkerIdRef.current = unreadId;
-          pendingScrollToUnreadRef.current = unreadId;
-          pendingScrollToBottomRef.current = false;
-          userScrolledUpRef.current = false;
-          setUserScrolledUp(false);
-          isAtBottomRef.current = false;
-          setIsAtBottom(false);
-        } else {
-          setUnreadMarkerId(null);
-          unreadMarkerIdRef.current = null;
-          pendingScrollToBottomRef.current = true;
-          userScrolledUpRef.current = false;
-          setUserScrolledUp(false);
-          isAtBottomRef.current = true;
-          setIsAtBottom(true);
-          shouldAutoMarkReadRef.current = true;
-        }
-
-        openingHadUnreadRef.current = false;
-        openingUnreadCountRef.current = 0;
-        openingChatRef.current = false;
-        // Enable pagination after initial load completes (works on both desktop and mobile)
-        allowStartReachedRef.current = true;
-      }
-
-      if (options.forceBottom) {
-        pendingScrollToBottomRef.current = true;
-        isAtBottomRef.current = true;
-        setIsAtBottom(true);
-        userScrolledUpRef.current = false;
-        setUserScrolledUp(false);
-      }
-
-      if (!options.silent) {
-        setUnreadInChat(0);
-      }
-
-        const hasPendingUnreadAnchor =
-          pendingScrollToUnreadRef.current !== null ||
-          unreadMarkerIdRef.current !== null;
-        const keepUnreadAnchor =
-          hasPendingUnreadAnchor ||
-          (Boolean(options.initialLoad) &&
-            Number(openingUnreadCountRef.current || 0) > 0);
-      const unreadAnchorLocked =
-        unreadMarkerIdRef.current !== null &&
-        Date.now() < Number(unreadAnchorLockUntilRef.current || 0);
-      if (!keepUnreadAnchor && !unreadAnchorLocked) {
-        if (newFromSelf) {
-          pendingScrollToBottomRef.current = true;
-          isAtBottomRef.current = true;
-          setIsAtBottom(true);
-          userScrolledUpRef.current = false;
-          setUserScrolledUp(false);
-        } else if (hasNew && !userScrolledUpRef.current) {
-          pendingScrollToBottomRef.current = true;
-          isAtBottomRef.current = true;
-          setIsAtBottom(true);
-        }
-      }
-      if (
-        activeChat?.type === "dm" &&
-        hasUnreadFromOthers &&
-        isAppActive &&
-        (!isMobileViewport || mobileTab === "chat") &&
-        isAtBottomRef.current &&
-        !userScrolledUpRef.current &&
-        (shouldAutoMarkReadRef.current || options.initialLoad)
-      ) {
-        await markMessagesRead({ chatId, username: user.username }).catch(() => null);
-      }
-    } catch {
-      // Keep chat window free of transient fetch errors.
-    } finally {
-      messageFetchInFlightRef.current = false;
-      if (queuedSilentMessageRefreshRef.current) {
-        const queued = queuedSilentMessageRefreshRef.current;
-        queuedSilentMessageRefreshRef.current = null;
-        void loadMessages(queued.chatId, queued.options);
-      }
-      if (!options.silent) {
-        setLoadingMessages(false);
+      if (queued) {
+        void loadChats(queued);
       }
     }
   }
+
 
   function clearPendingUploads() {
     setPendingUploadFiles((prev) => {
@@ -3729,10 +3460,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       previewUrl,
       kind: "voice",
     });
-    if (activeChatId) {
+    if (activeChatId && !userScrolledUpRef.current) {
       pendingScrollToBottomRef.current = true;
-      userScrolledUpRef.current = false;
-      setUserScrolledUp(false);
       isAtBottomRef.current = true;
       setIsAtBottom(true);
       scrollChatToBottom("auto");
@@ -4013,10 +3742,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
     setPendingUploadFiles((prev) => (append ? [...prev, ...nextItems] : nextItems));
     setPendingUploadType(uploadType);
-    if (activeChatId) {
+    if (activeChatId && !userScrolledUpRef.current) {
       pendingScrollToBottomRef.current = true;
-      userScrolledUpRef.current = false;
-      setUserScrolledUp(false);
       isAtBottomRef.current = true;
       setIsAtBottom(true);
       scrollChatToBottom("auto");
@@ -4031,23 +3758,78 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
   const handleMessageInput = useCallback(
     (value) => {
-      if (!uploadError) return;
-      if (!String(uploadError).toLowerCase().includes("message must be")) return;
       const trimmed = String(value || "").trim();
-      if (trimmed.length <= APP_CONFIG.messageMaxChars) {
+      if (
+        uploadError &&
+        String(uploadError).toLowerCase().includes("message must be") &&
+        trimmed.length <= APP_CONFIG.messageMaxChars
+      ) {
         setUploadError("");
       }
+
+      const chatId = Number(activeChatId || 0);
+      const activeType = String(activeChatTypeRef.current || "").toLowerCase();
+      if (!chatId || !canSendInActiveChat || activeType === "channel") {
+        stopTypingIndicator(chatId);
+        return;
+      }
+
+      const shouldType = Boolean(trimmed.length);
+      const typingState = typingStateRef.current;
+      const now = Date.now();
+
+      if (typingState.chatId !== chatId && typingState.isTyping) {
+        stopTypingIndicator(typingState.chatId);
+      }
+
+      if (!shouldType) {
+        stopTypingIndicator(chatId);
+        return;
+      }
+
+      clearLocalTypingStopTimer();
+      typingStopTimerRef.current = window.setTimeout(() => {
+        stopTypingIndicator(chatId);
+      }, TYPING_IDLE_TIMEOUT_MS);
+
+      const shouldSendTypingSignal =
+        !typingState.isTyping ||
+        typingState.chatId !== chatId ||
+        now - Number(typingState.lastSentAt || 0) >= TYPING_SIGNAL_THROTTLE_MS;
+
+      if (shouldSendTypingSignal) {
+        sendTypingSignal(chatId, true);
+        typingStateRef.current = {
+          chatId,
+          isTyping: true,
+          lastSentAt: now,
+        };
+      }
     },
-    [uploadError],
+    [
+      activeChatId,
+      canSendInActiveChat,
+      clearLocalTypingStopTimer,
+      sendTypingSignal,
+      stopTypingIndicator,
+      uploadError,
+      TYPING_IDLE_TIMEOUT_MS,
+      TYPING_SIGNAL_THROTTLE_MS,
+    ],
   );
 
   async function handleSend(event) {
     event.preventDefault();
     if (!activeChatId) return;
-    userScrolledUpRef.current = false;
-    setUserScrolledUp(false);
-    isAtBottomRef.current = true;
-    setIsAtBottom(true);
+    stopTypingIndicator(activeChatId);
+    const isEditingMessage = Number(editTarget?.id || 0) > 0;
+    const shouldSnapToBottom = !(isEditingMessage && userScrolledUpRef.current);
+    if (shouldSnapToBottom) {
+      userScrolledUpRef.current = false;
+      setUserScrolledUp(false);
+      isAtBottomRef.current = true;
+      setIsAtBottom(true);
+    }
     shouldAutoMarkReadRef.current = true;
     setUnreadMarkerId(null);
     unreadMarkerIdRef.current = null;
@@ -4073,10 +3855,15 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
 
     const pendingFilesSummary = hasAnyPendingFiles
-      ? summarizeFiles([
-          ...pendingUploadFiles,
-          ...(hasPendingVoice && pendingVoiceMessage ? [pendingVoiceMessage] : []),
-        ])
+      ? summarizeFiles(
+          [
+            ...pendingUploadFiles,
+            ...(hasPendingVoice && pendingVoiceMessage
+              ? [pendingVoiceMessage]
+              : []),
+          ],
+          hasPendingFiles ? pendingUploadType : "",
+        )
       : "";
     const isSavedChat = isActiveSavedChat;
 
@@ -4085,11 +3872,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     const queuedAt = Date.now();
     const pendingDate = parseServerDate(createdAt);
     const pendingDayKey = `${pendingDate.getFullYear()}-${pendingDate.getMonth()}-${pendingDate.getDate()}`;
-    const fallbackBody =
-      trimmedBody ||
-      (hasPendingFiles
-        ? pendingFilesSummary || `Sent ${pendingUploadFiles.length} files`
-        : "");
+    const fallbackBody = trimmedBody || "";
     const pendingFiles = hasAnyPendingFiles
       ? [
           ...pendingUploadFiles.map((item) => {
@@ -4144,7 +3927,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
             : []),
         ]
       : [];
-    const replyPayload = replyTarget
+    const replyPayload = !isEditingMessage && replyTarget
       ? {
           id: replyTarget.id,
           username: replyTarget.username,
@@ -4166,24 +3949,47 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       form.reset();
       clearPendingUploads();
       clearPendingVoiceMessage();
-      pendingScrollToBottomRef.current = true;
+      pendingScrollToBottomRef.current = shouldSnapToBottom;
 
       const pendingMessage = {
         _clientId: tempId,
         _chatId: Number(activeChatId),
         _queuedAt: queuedAt,
         _delivery: "sending",
+        _editMessageId: isEditingMessage ? Number(editTarget.id) : null,
         _uploadType: effectiveUploadType,
         _files: pendingFiles,
         _createdAt: createdAt,
         _dayKey: pendingDayKey,
-        body: fallbackBody,
+        body: trimmedBody || (isEditingMessage ? String(editTarget?.body || "") : ""),
         replyTo: replyPayload,
         read_at: isSavedChat ? createdAt : null,
         read_by_user_id: isSavedChat ? Number(user?.id || 0) : null,
       };
       await sendPendingMessage(pendingMessage);
       setReplyTarget(null);
+      setEditTarget(null);
+      return;
+    }
+
+    if (isEditingMessage) {
+      form.reset();
+      clearPendingUploads();
+      clearPendingVoiceMessage();
+      pendingScrollToBottomRef.current = shouldSnapToBottom;
+      const pendingMessage = {
+        _clientId: tempId,
+        _chatId: Number(activeChatId),
+        _queuedAt: queuedAt,
+        _delivery: "sending",
+        _editMessageId: Number(editTarget.id),
+        _uploadType: effectiveUploadType,
+        _files: pendingFiles,
+        body: trimmedBody,
+      };
+      await sendPendingMessage(pendingMessage);
+      setReplyTarget(null);
+      setEditTarget(null);
       return;
     }
 
@@ -4192,7 +3998,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       {
         id: tempId,
         username: user.username,
-        body: fallbackBody,
+        body: trimmedBody,
         created_at: createdAt,
         read_at: isSavedChat ? createdAt : null,
         read_by_user_id: isSavedChat ? Number(user?.id || 0) : null,
@@ -4225,7 +4031,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     form.reset();
     clearPendingUploads();
     clearPendingVoiceMessage();
-    pendingScrollToBottomRef.current = true;
+    pendingScrollToBottomRef.current = shouldSnapToBottom;
     setReplyTarget(null);
 
     if (!isConnected) {
@@ -4239,7 +4045,7 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       _delivery: "sending",
       _uploadType: effectiveUploadType,
       _files: pendingFiles,
-      body: fallbackBody,
+      body: trimmedBody,
       replyTo: replyPayload,
     };
     await sendPendingMessage(pendingMessage);
@@ -4454,430 +4260,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     setShowSettings(false);
     setMobileTab("chats");
   }
-
-  const formatBytes = (bytes) => {
-    const value = Number(bytes || 0);
-    if (!Number.isFinite(value) || value <= 0) return "0 B";
-    const kb = 1024;
-    const mb = kb * 1024;
-    if (value >= mb) return `${(value / mb).toFixed(2)} MB`;
-    if (value >= kb) return `${Math.round(value / kb)} KB`;
-    return `${Math.max(1, Math.round(value))} B`;
-  };
-
-  const getCacheStats = useCallback(() => {
-    if (typeof window === "undefined" || !canUseLocalStorage()) {
-      return {
-        totalBytes: 0,
-        totalLabel: "0 B",
-        chatList: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-          entries: [],
-        },
-        messageCaches: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          entries: [],
-        },
-        mediaThumbs: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-        },
-        mediaPosters: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-        },
-        voiceWaveforms: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-        },
-      };
-    }
-
-    const username = String(user?.username || "").toLowerCase();
-    let totalBytes = 0;
-    let chatListSizeBytes = 0;
-    let messageCacheSizeBytes = 0;
-    let mediaThumbSizeBytes = 0;
-    let mediaPosterSizeBytes = 0;
-    let voiceWaveformSizeBytes = 0;
-    let chatListUpdatedAt = null;
-    let mediaThumbUpdatedAt = null;
-    let mediaPosterUpdatedAt = null;
-    let voiceWaveformUpdatedAt = null;
-    const chatListEntries = [];
-    const messageCacheEntries = [];
-    const chatNameById = new Map();
-
-    const addSize = (value) => {
-      if (typeof value !== "string") return;
-      const bytes = new Blob([value]).size;
-      totalBytes += bytes;
-      return bytes;
-    };
-
-    const chatListKey = buildChatListCacheKey(username);
-    const messagesIndexKey = buildMessagesIndexKey(username);
-    let mediaThumbParsed = null;
-    let mediaPosterParsed = null;
-    let voiceWaveformParsed = null;
-
-    try {
-      for (let i = 0; i < window.localStorage.length; i += 1) {
-        const key = window.localStorage.key(i);
-        if (!key) continue;
-        const value = window.localStorage.getItem(key);
-        if (key === chatListKey) {
-          const size = addSize(value);
-          const parsed = safeParseJson(value);
-          const chats = Array.isArray(parsed?.chats) ? parsed.chats : [];
-          chatListSizeBytes += size || 0;
-          chatListUpdatedAt = parsed?.updatedAt || null;
-          chats.forEach((chat) => {
-            const chatId = Number(chat?.id || 0);
-            if (chatId) {
-              chatNameById.set(
-                chatId,
-                String(chat?.name || chat?.group_username || chat?.username || "Chat"),
-              );
-            }
-            chatListEntries.push({
-              id: chatId,
-              name: String(chat?.name || chat?.group_username || chat?.username || "Chat"),
-              type: String(chat?.type || "").toLowerCase() || "chat",
-              lastTime: chat?.last_time || null,
-              avatar_url: chat?.group_avatar_url || null,
-              color: chat?.group_color || null,
-              members: Array.isArray(chat?.members) ? chat.members : [],
-            });
-          });
-          continue;
-        }
-        if (key === messagesIndexKey) {
-          addSize(value);
-          continue;
-        }
-        if (key.startsWith(`${CHAT_MESSAGES_CACHE_KEY}:${username}:`)) {
-          const size = addSize(value);
-          messageCacheSizeBytes += size || 0;
-          const parsed = safeParseJson(value);
-          const chatId = Number(parsed?.chatId || key.split(":").pop() || 0);
-          const messageCount = Array.isArray(parsed?.messages) ? parsed.messages.length : 0;
-          const updatedAt = parsed?.updatedAt || null;
-          messageCacheEntries.push({
-            chatId,
-            chatName: chatNameById.get(chatId) || `Chat ${chatId || ""}`.trim(),
-            messageCount,
-            updatedAt,
-            sizeBytes: size || 0,
-          });
-          continue;
-        }
-        if (key === MEDIA_THUMB_CACHE_KEY) {
-          const size = addSize(value);
-          mediaThumbSizeBytes += size || 0;
-          mediaThumbParsed = safeParseJson(value);
-          mediaThumbUpdatedAt = mediaThumbParsed?.updatedAt || null;
-          continue;
-        }
-        if (key === MEDIA_POSTER_CACHE_KEY) {
-          const size = addSize(value);
-          mediaPosterSizeBytes += size || 0;
-          mediaPosterParsed = safeParseJson(value);
-          mediaPosterUpdatedAt = mediaPosterParsed?.updatedAt || null;
-          continue;
-        }
-        if (key === VOICE_WAVEFORM_CACHE_KEY) {
-          const size = addSize(value);
-          voiceWaveformSizeBytes += size || 0;
-          voiceWaveformParsed = safeParseJson(value);
-          voiceWaveformUpdatedAt = voiceWaveformParsed?.updatedAt || null;
-          continue;
-        }
-      }
-    } catch {
-      return {
-        totalBytes: 0,
-        totalLabel: "0 B",
-        chatList: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-          entries: [],
-        },
-        messageCaches: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          entries: [],
-        },
-        mediaThumbs: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-        },
-        mediaPosters: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-        },
-        voiceWaveforms: {
-          count: 0,
-          sizeBytes: 0,
-          sizeLabel: "0 B",
-          updatedAt: null,
-        },
-      };
-    }
-
-    return {
-      totalBytes,
-      totalLabel: formatBytes(totalBytes),
-      chatList: {
-        count: chatListEntries.length,
-        sizeBytes: chatListSizeBytes,
-        sizeLabel: formatBytes(chatListSizeBytes),
-        updatedAt: chatListUpdatedAt,
-        entries: chatListEntries,
-      },
-      messageCaches: {
-        count: messageCacheEntries.length,
-        sizeBytes: messageCacheSizeBytes,
-        sizeLabel: formatBytes(messageCacheSizeBytes),
-        entries: messageCacheEntries.map((entry) => ({
-          ...entry,
-          sizeLabel: formatBytes(entry.sizeBytes),
-        })),
-      },
-      mediaThumbs: {
-        count: Array.isArray(mediaThumbParsed?.items) ? mediaThumbParsed.items.length : 0,
-        sizeBytes: mediaThumbSizeBytes,
-        sizeLabel: formatBytes(mediaThumbSizeBytes),
-        updatedAt: mediaThumbUpdatedAt,
-      },
-      mediaPosters: {
-        count: mediaPosterParsed?.posters ? Object.keys(mediaPosterParsed.posters || {}).length : 0,
-        sizeBytes: mediaPosterSizeBytes,
-        sizeLabel: formatBytes(mediaPosterSizeBytes),
-        updatedAt: mediaPosterUpdatedAt,
-      },
-      voiceWaveforms: {
-        count: Array.isArray(voiceWaveformParsed?.entries)
-          ? voiceWaveformParsed.entries.length
-          : 0,
-        sizeBytes: voiceWaveformSizeBytes,
-        sizeLabel: formatBytes(voiceWaveformSizeBytes),
-        updatedAt: voiceWaveformUpdatedAt,
-      },
-    };
-  }, [user?.username]);
-
-  const getCacheStatsFromIdb = useCallback(async () => {
-    if (!canUseIdb()) {
-      return getCacheStats();
-    }
-    const username = String(user?.username || "").toLowerCase();
-    const chatListKey = buildChatListCacheKey(username);
-    const chatNameById = new Map();
-    let totalBytes = 0;
-    let chatListSizeBytes = 0;
-    let messageCacheSizeBytes = 0;
-    let chatListUpdatedAt = null;
-    const chatListEntries = [];
-    const messageCacheEntries = [];
-
-    const chatListEntry = await idbGet(CACHE_STORES.chatList, chatListKey);
-    if (chatListEntry?.data) {
-      totalBytes += Number(chatListEntry.sizeBytes || 0);
-      chatListSizeBytes += Number(chatListEntry.sizeBytes || 0);
-      const parsed = chatListEntry.data;
-      chatListUpdatedAt = parsed?.updatedAt || null;
-      const chats = Array.isArray(parsed?.chats) ? parsed.chats : [];
-      chats.forEach((chat) => {
-        const chatId = Number(chat?.id || 0);
-        if (chatId) {
-          chatNameById.set(
-            chatId,
-            String(chat?.name || chat?.group_username || chat?.username || "Chat"),
-          );
-        }
-        chatListEntries.push({
-          id: chatId,
-          name: String(chat?.name || chat?.group_username || chat?.username || "Chat"),
-          type: String(chat?.type || "").toLowerCase() || "chat",
-          lastTime: chat?.last_time || null,
-          avatar_url: chat?.group_avatar_url || null,
-          color: chat?.group_color || null,
-          members: Array.isArray(chat?.members) ? chat.members : [],
-        });
-      });
-    }
-
-    const messageEntries = await idbGetAllEntries(CACHE_STORES.messages);
-    messageEntries.forEach((entry) => {
-      if (!entry?.data) return;
-      const size = Number(entry.sizeBytes || 0);
-      totalBytes += size;
-      messageCacheSizeBytes += size;
-      const parsed = entry.data;
-      const chatId = Number(parsed?.chatId || 0);
-      const messageCount = Array.isArray(parsed?.messages) ? parsed.messages.length : 0;
-      const updatedAt = parsed?.updatedAt || null;
-      messageCacheEntries.push({
-        chatId,
-        chatName: chatNameById.get(chatId) || `Chat ${chatId || ""}`.trim(),
-        messageCount,
-        updatedAt,
-        sizeBytes: size,
-      });
-    });
-
-    return {
-      totalBytes,
-      totalLabel: formatBytes(totalBytes),
-      chatList: {
-        count: chatListEntries.length,
-        sizeBytes: chatListSizeBytes,
-        sizeLabel: formatBytes(chatListSizeBytes),
-        updatedAt: chatListUpdatedAt,
-        entries: chatListEntries,
-      },
-      messageCaches: {
-        count: messageCacheEntries.length,
-        sizeBytes: messageCacheSizeBytes,
-        sizeLabel: formatBytes(messageCacheSizeBytes),
-        entries: messageCacheEntries.map((entry) => ({
-          ...entry,
-          sizeLabel: formatBytes(entry.sizeBytes),
-        })),
-      },
-      mediaThumbs: {
-        count: 0,
-        sizeBytes: 0,
-        sizeLabel: "0 B",
-        updatedAt: null,
-      },
-      mediaPosters: {
-        count: 0,
-        sizeBytes: 0,
-        sizeLabel: "0 B",
-        updatedAt: null,
-      },
-      voiceWaveforms: {
-        count: 0,
-        sizeBytes: 0,
-        sizeLabel: "0 B",
-        updatedAt: null,
-      },
-    };
-  }, [getCacheStats, user?.username]);
-
-  useEffect(() => {
-    if (settingsPanel !== "data") return;
-    setDataCacheStats(getCacheStats());
-    if (!canUseLocalStorage() && canUseIdb()) {
-      let isActive = true;
-      void (async () => {
-        const stats = await getCacheStatsFromIdb();
-        if (isActive) {
-          setDataCacheStats(stats);
-        }
-      })();
-      return () => {
-        isActive = false;
-      };
-    }
-  }, [getCacheStats, getCacheStatsFromIdb, settingsPanel, user?.username]);
-
-  const handleClearCache = useCallback(async () => {
-    if (typeof window === "undefined") return;
-    if (!canUseLocalStorage()) {
-      messagesCacheRef.current.clear();
-      if (canUseIdb()) {
-        await Promise.all([
-          idbClearStore(CACHE_STORES.chatList),
-          idbClearStore(CACHE_STORES.messages),
-          idbClearStore(CACHE_STORES.index),
-        ]).catch(() => null);
-        // Refresh stats from IndexedDB after clearing
-        setTimeout(() => {
-          void (async () => {
-            const stats = await getCacheStatsFromIdb();
-            setDataCacheStats(stats);
-          })();
-        }, 100);
-      } else {
-        setDataCacheStats(getCacheStats());
-      }
-      return;
-    }
-    const username = String(user?.username || "").toLowerCase();
-    if (username) {
-      const keysToRemove = [];
-      for (let i = 0; i < window.localStorage.length; i += 1) {
-        const key = window.localStorage.key(i);
-        if (!key) continue;
-        if (
-          key === buildChatListCacheKey(username) ||
-          key === buildMessagesIndexKey(username) ||
-          key.startsWith(`${CHAT_MESSAGES_CACHE_KEY}:${username}:`)
-        ) {
-          keysToRemove.push(key);
-        }
-      }
-      keysToRemove.forEach((key) => removeLocalCache(key));
-    }
-
-    [
-      MEDIA_THUMB_CACHE_KEY,
-      MEDIA_POSTER_CACHE_KEY,
-      VOICE_WAVEFORM_CACHE_KEY,
-      "chat-media-thumbs",
-      "chat-video-posters-v2",
-    ].forEach((key) => removeLocalCache(key));
-
-    try {
-      window.sessionStorage.removeItem("chat-media-thumbs");
-      window.sessionStorage.removeItem("chat-video-posters-v2");
-    } catch {
-      // ignore storage failures
-    }
-
-    messagesCacheRef.current.clear();
-    
-    // Clear IndexedDB in parallel
-    if (canUseIdb()) {
-      await Promise.all([
-        idbClearStore(CACHE_STORES.chatList),
-        idbClearStore(CACHE_STORES.messages),
-        idbClearStore(CACHE_STORES.index),
-      ]).catch(() => null);
-    }
-
-    // Update stats to reflect cleared cache
-    setTimeout(() => {
-      setDataCacheStats(getCacheStats());
-      if (canUseIdb()) {
-        void (async () => {
-          const stats = await getCacheStatsFromIdb();
-          setDataCacheStats(stats);
-        })();
-      }
-    }, 100);
-  }, [getCacheStats, getCacheStatsFromIdb, user?.username]);
 
   const closeNewChatModal = () => {
     setNewChatOpen(false);
@@ -5397,22 +4779,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
   }
 
-  async function handleLeaveActiveGroup() {
-    if (!activeChat || !["group", "channel"].includes(activeChat.type)) return;
-    try {
-      const res = await leaveGroupChat(activeChat.id, { username: user.username });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || "Unable to leave group.");
-      }
-      closeProfileModal();
-      closeChat();
-      await loadChats();
-    } catch {
-      // ignore
-    }
-  }
-
   async function handleRemoveGroupMember(member) {
     if (!activeChat || !["group", "channel"].includes(activeChat.type) || !member?.username)
       return;
@@ -5430,6 +4796,26 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
       // ignore
     }
   }
+
+  const { contextMenu, closeContextMenu, openContextMenu } = useAppContextMenu({
+    activeChatId,
+    chats,
+    currentUsername: user?.username,
+    canCurrentUserEditGroup,
+    canEditMessage: canEditMessageFromContext,
+    canDeleteMessageForEveryone,
+    onReplyToMessage: handleStartReply,
+    onEditMessage: handleStartEdit,
+    onDeleteMessage: handleDeleteMessageRequest,
+    onForwardMessage: handleOpenForwardModal,
+    onSaveMessageFiles: handleSaveMessageFiles,
+    onOpenOrCreateDm: openOrCreateDmFromMember,
+    onOpenProfile: openMemberProfileFromList,
+    onRemoveGroupMember: handleRemoveGroupMember,
+    onMarkChatSeen: handleMarkChatSeen,
+    onToggleChatMute: toggleMuteChat,
+    onDeleteChats: requestDeleteChats,
+  });
 
   async function handleDeleteAccount(password) {
     if (!user?.username) return;
@@ -5519,11 +4905,6 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
   const exitSearchMode = () => {
     setChatsSearchFocused(false);
     setChatsSearchQuery("");
-    setDiscoverLoading(false);
-    setDiscoverUsers([]);
-    setDiscoverGroups([]);
-    setDiscoverChannels([]);
-    setDiscoverSaved(false);
     setSidebarScrollEpoch((prev) => prev + 1);
     if (typeof document !== "undefined") {
       const activeEl = document.activeElement;
@@ -5538,9 +4919,48 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
     }
   };
   const handleUserScrollIntent = () => {
+    cancelSmoothScroll?.();
     allowStartReachedRef.current = true;
   };
   const usernamePattern = /^[a-z0-9._]+$/;
+  const shouldPromptNotifications =
+    notificationsSupported &&
+    notificationPermission === "default" &&
+    !permissionsDismissed.notification;
+  const shouldPromptMicrophone =
+    microphonePermissionSupported &&
+    microphonePermission === "prompt" &&
+    !permissionsDismissed.microphone;
+  const permissionPromptDelayActive =
+    permissionPromptDelayUntil > Date.now();
+  const activePermissionPrompt = shouldPromptNotifications
+    ? "notification"
+    : shouldPromptMicrophone
+      ? "microphone"
+      : null;
+  const showPermissionsPrompt = Boolean(
+    activePermissionPrompt && !permissionPromptDelayActive,
+  );
+
+  useEffect(() => {
+    if (!permissionPromptDelayUntil) return undefined;
+    const remainingMs = permissionPromptDelayUntil - Date.now();
+    if (remainingMs <= 0) {
+      setPermissionPromptDelayUntil(0);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setPermissionPromptDelayUntil(0);
+    }, remainingMs);
+    return () => window.clearTimeout(timer);
+  }, [permissionPromptDelayUntil]);
+
+  useEffect(() => {
+    setPermissionsDismissed({
+      notification: readPermissionDismissed("notification"),
+      microphone: readPermissionDismissed("microphone"),
+    });
+  }, [isAppActive, notificationPermission, microphonePermission]);
 
   return (
     <div
@@ -5595,6 +5015,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         isSavedChatActive={isActiveSavedChat}
         onOpenDiscoveredUser={openDiscoverUser}
         onOpenDiscoveredGroup={openDiscoverGroup}
+        onOpenUserProfileContext={openMemberProfileFromList}
+        onOpenUserContextMenu={openContextMenu}
+        onOpenChatContextMenu={openContextMenu}
         showSettings={showSettings}
         settingsMenuRef={settingsMenuRef}
         setSettingsPanel={setSettingsPanel}
@@ -5635,6 +5058,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         onClearCache={handleClearCache}
         dataCacheStats={dataCacheStats}
         onDeleteAccount={handleDeleteAccount}
+        appInfo={appInfo}
+        appInfoLoading={appInfoLoading}
+        appInfoError={appInfoError}
         onExitEdit={handleExitEdit}
         onEnterEdit={handleEnterEdit}
         onDeleteChats={handleDeleteChats}
@@ -5642,15 +5068,18 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         onOpenOwnProfile={openOwnProfileModal}
         settingsButtonRef={settingsButtonRef}
         displayInitials={displayInitials}
+        onOpenWhatsNew={handleOpenWhatsNew}
       />
 
       <ChatWindowPanel
         mobileTab={mobileTab}
         activeChatId={activeChatId}
+        activeChat={activeChat}
         closeChat={closeChat}
         activeHeaderPeer={activeHeaderAvatar}
         activeFallbackTitle={activeFallbackTitle}
-        peerStatusLabel={activeHeaderSubtitle}
+        peerStatusLabel={resolvedHeaderSubtitle}
+        typingIndicator={typingIndicator}
         isGroupChat={isActiveGroupChat}
         isChannelChat={isActiveChannelChat}
         isSavedChat={isActiveSavedChat}
@@ -5658,6 +5087,9 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         groupAvatarUrl={activeGroupAvatarUrl}
         channelSeenCounts={channelSeenCounts}
         chatScrollRef={chatScrollRef}
+        composerInputRef={composerInputRef}
+        smoothScrollLockRef={smoothScrollLockRef}
+        isAtBottomRef={isAtBottomRef}
         onChatScroll={handleChatScrollWithSeen}
         onStartReached={handleStartReached}
         messages={messages}
@@ -5691,19 +5123,46 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         onMessageInput={handleMessageInput}
         replyTarget={replyTarget}
         onClearReply={handleClearReply}
+        editTarget={editTarget}
+        onClearEdit={handleClearEdit}
         onReplyToMessage={handleStartReply}
         onOpenHeaderProfile={openActiveChatProfile}
         onOpenMessageSenderProfile={openMemberProfileFromMessage}
         onOpenMention={openMentionProfile}
+        onOpenForwardOrigin={handleOpenForwardOrigin}
+        onForwardMessage={handleOpenForwardModal}
+        onOpenContextMenu={openContextMenu}
         onUserScrollIntent={handleUserScrollIntent}
+        canSwipeReply={canSwipeReply}
         fileUploadEnabled={CHAT_PAGE_CONFIG.fileUploadEnabled}
         fileUploadInProgress={fileUploadInProgress || activeUploadProgress !== null}
         showComposer={canSendInActiveChat}
+        isChannelMuted={activeChatMuted}
+        onToggleChannelMute={() => toggleMuteChat(activeChat?.id)}
         headerClickable={!isActiveSavedChat}
         showStatus={!isActiveSavedChat}
         headerAvatarIcon={activeHeaderAvatarIcon}
         headerAvatarColor={headerAvatarColor}
         mentionRefreshToken={mentionRefreshToken}
+        copyToastVisible={copyToastVisible}
+        microphonePermissionStatus={microphonePermission}
+        onRequestMicrophonePermission={requestMicrophonePermission}
+        permissionsPrompt={{
+          show: showPermissionsPrompt,
+          mode: activePermissionPrompt,
+          notification: {
+            show: shouldPromptNotifications,
+            status: notificationPermission,
+            onRequest: requestNotificationsPermission,
+          },
+          microphone: {
+            show: shouldPromptMicrophone,
+            status: microphonePermission,
+            onRequest: requestMicrophonePermission,
+          },
+          onDismiss: (mode) =>
+            dismissPermissionsPrompt(mode || activePermissionPrompt),
+        }}
       />
 
       <MobileTabMenu
@@ -5716,156 +5175,252 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
         onSettings={() => setMobileTab("settings")}
       />
 
-      <NewChatModal
-        open={newChatOpen}
-        newChatUsername={newChatUsername}
-        setNewChatUsername={setNewChatUsername}
-        newChatError={newChatError}
-        setNewChatError={setNewChatError}
-        newChatResults={newChatResults}
-        newChatSelection={newChatSelection}
-        setNewChatSelection={setNewChatSelection}
-        newChatLoading={newChatLoading}
-        canStartChat={canStartChat}
-        startDirectMessage={startDirectMessage}
-        onClose={closeNewChatModal}
-      />
-
-      <DeleteChatsModal
-        open={confirmDeleteOpen}
-        pendingDeleteIds={pendingDeleteIds}
-        selectedChats={selectedChats}
-        setConfirmDeleteOpen={setConfirmDeleteOpen}
-        confirmDeleteChats={confirmDeleteChats}
-      />
-
-      <NewGroupModal
-        open={newGroupOpen}
-        groupForm={newGroupForm}
-        setGroupForm={setNewGroupForm}
-        groupSearchQuery={newGroupSearch}
-        setGroupSearchQuery={setNewGroupSearch}
-        groupSearchResults={newGroupSearchResults}
-        groupSearchLoading={newGroupSearchLoading}
-        selectedGroupMembers={newGroupMembers}
-        setSelectedGroupMembers={setNewGroupMembers}
-        groupError={newGroupError}
-        setGroupError={setNewGroupError}
-        creatingGroup={creatingGroup}
-        onCreate={handleCreateGroup}
-        onClose={closeNewGroupModal}
-        title={
-          editingGroup
-            ? `Edit ${groupModalType === "channel" ? "channel" : "group"}`
-            : `New ${groupModalType === "channel" ? "channel" : "group"}`
-        }
-        submitLabel={editingGroup ? "Save" : "Create"}
-        avatarPreview={groupAvatarPreview}
-        avatarColor={editingGroup ? activeChat?.group_color || "#10b981" : "#10b981"}
-        avatarName={
-          newGroupForm.nickname ||
-          newGroupForm.username ||
-          (groupModalType === "channel" ? "Channel" : "Group")
-        }
-        onAvatarChange={handleGroupAvatarChange}
-        onAvatarRemove={handleGroupAvatarRemove}
-        showAvatarField={editingGroup}
-        hideSelectedMemberChips={false}
-        fileUploadEnabled={CHAT_PAGE_CONFIG.fileUploadEnabled}
-        showInviteManagement={editingGroup}
-        currentInviteLink={editGroupInviteLink}
-        regeneratingInviteLink={regeneratingGroupInviteLink}
-        onRegenerateInvite={handleRegenerateGroupInvite}
-        entityLabel={groupModalType === "channel" ? "Channel" : "Group"}
-        onDeleteChat={editingGroup ? handleDeleteActiveGroup : null}
-      />
-
-      <GroupInviteLinkModal
-        open={groupInviteOpen}
-        inviteLink={createdGroupInviteLink}
-        onClose={() => setGroupInviteOpen(false)}
-      />
-
-      <ChatProfileModal
-        open={profileModalOpen}
-        chat={
-          mentionProfileChat ||
-          ((mentionProfileUser || profileModalMember)
-            ? { ...(activeChat || {}), type: "dm" }
-            : activeChat)
-        }
-        targetUser={profileTargetUser}
-        currentUser={user}
-        muted={activeChatMuted}
-        inviteLink={profileInviteLink}
-        canViewInvite={canCurrentUserViewInvite}
-        readOnly={Boolean(
-          mentionProfile &&
-            mentionProfile.kind !== "user" &&
-            !mentionProfileChat?.isMember,
-        )}
-        showJoinAction={canJoinMentionChat}
-        onJoinChat={handleJoinMentionChat}
-        showMembers={shouldShowMembersList}
-        membersBatchSize={CHAT_PAGE_CONFIG.newChatSearchMaxResults}
-        onClose={closeProfileModal}
-        onOpenChat={handleOpenProfileChat}
-        onToggleMute={() =>
-          toggleMuteChat(mentionProfileChat?.id || activeChat?.id)
-        }
-        onLeaveGroup={() =>
-          handleLeaveGroupById(mentionProfileChat?.id || activeChat?.id)
-        }
-        onOpenMember={openMemberProfileFromList}
-        onRemoveMember={handleRemoveGroupMember}
-        onEditGroup={openEditGroupFromProfile}
-        onEditSelfProfile={openSelfProfileEditor}
-      />
-
-      <NotificationsSettingsModal
-        open={notificationsModalOpen}
-        onClose={() => setNotificationsModalOpen(false)}
-        notificationsActive={notificationsActive}
-        notificationsDisabled={notificationsDisabled}
-        notificationStatusLabel={notificationStatusLabel}
-        onToggleNotifications={handleToggleNotifications}
-        onTestPush={handleTestPush}
-        testNotificationSent={testNotificationSent}
-        notificationsEnabled={notificationsEnabled}
-        debugLine={notificationsDebugLine}
-      />
-
-        {settingsPanel && mobileTab !== "settings" ? (
-        <DesktopSettingsModal
-          settingsPanel={settingsPanel}
-          setSettingsPanel={setSettingsPanel}
-          handleProfileSave={handleProfileSave}
-          avatarPreview={avatarPreview}
-          profileForm={profileForm}
-          handleAvatarChange={handleAvatarChange}
-          handleAvatarRemove={handleAvatarRemove}
-          setProfileForm={setProfileForm}
-          statusSelection={statusSelection}
-          setStatusSelection={setStatusSelection}
-          handlePasswordSave={handlePasswordSave}
-          passwordForm={passwordForm}
-          setPasswordForm={setPasswordForm}
-          userColor={userColor}
-          profileError={profileError}
-          passwordError={passwordError}
-          fileUploadEnabled={CHAT_PAGE_CONFIG.fileUploadEnabled}
-          onClearCache={handleClearCache}
-          dataCacheStats={dataCacheStats}
-          currentUser={user}
-          onDeleteAccount={handleDeleteAccount}
-        />
+      {newChatOpen ? (
+        <Suspense fallback={null}>
+          <NewChatModal
+            open={newChatOpen}
+            newChatUsername={newChatUsername}
+            setNewChatUsername={setNewChatUsername}
+            newChatError={newChatError}
+            setNewChatError={setNewChatError}
+            newChatResults={newChatResults}
+            newChatSelection={newChatSelection}
+            setNewChatSelection={setNewChatSelection}
+            newChatLoading={newChatLoading}
+            canStartChat={canStartChat}
+            startDirectMessage={startDirectMessage}
+            onClose={closeNewChatModal}
+          />
+        </Suspense>
       ) : null}
+
+      {confirmDeleteOpen ? (
+        <Suspense fallback={null}>
+          <DeleteChatsModal
+            open={confirmDeleteOpen}
+            pendingDeleteIds={pendingDeleteIds}
+            selectedChats={selectedChats}
+            setConfirmDeleteOpen={setConfirmDeleteOpen}
+            confirmDeleteChats={confirmDeleteChats}
+          />
+        </Suspense>
+      ) : null}
+
+      {messageDeleteScopeOpen ? (
+        <Suspense fallback={null}>
+          <DeleteMessageScopeModal
+            open={messageDeleteScopeOpen}
+            allowDeleteForEveryone={canDeleteMessageForEveryone(
+              pendingDeleteMessage,
+            )}
+            onClose={() => {
+              setMessageDeleteScopeOpen(false);
+              setPendingDeleteMessage(null);
+            }}
+            onConfirm={(deleteForEveryone) =>
+              performDeleteMessage(
+                pendingDeleteMessage,
+                deleteForEveryone ? "everyone" : "self",
+              )
+            }
+          />
+        </Suspense>
+      ) : null}
+
+      {forwardMessageTarget ? (
+        <Suspense fallback={null}>
+          <ForwardMessageModal
+            open={Boolean(forwardMessageTarget)}
+            chats={chats}
+            savedChat={forwardSavedChat}
+            currentUser={user}
+            sourceChatId={activeChatId}
+            onClose={() => {
+              setForwardMessageTarget(null);
+              setForwardSavedChat(null);
+            }}
+            onSubmit={handleForwardMessageSubmit}
+          />
+        </Suspense>
+      ) : null}
+
+      {confirmLeaveOpen ? (
+        <Suspense fallback={null}>
+          <LeaveGroupModal
+            open={confirmLeaveOpen}
+            onClose={() => {
+              setConfirmLeaveOpen(false);
+              setPendingLeaveChatId(null);
+            }}
+            onConfirm={confirmLeaveGroupById}
+            isChannel={(() => {
+              const leaveId = Number(pendingLeaveChatId || 0);
+              if (!leaveId) return false;
+              return chats.some(
+                (chat) => Number(chat.id) === leaveId && chat.type === "channel",
+              );
+            })()}
+          />
+        </Suspense>
+      ) : null}
+
+      {newGroupOpen ? (
+        <Suspense fallback={null}>
+          <NewGroupModal
+            open={newGroupOpen}
+            groupForm={newGroupForm}
+            setGroupForm={setNewGroupForm}
+            groupSearchQuery={newGroupSearch}
+            setGroupSearchQuery={setNewGroupSearch}
+            groupSearchResults={newGroupSearchResults}
+            groupSearchLoading={newGroupSearchLoading}
+            selectedGroupMembers={newGroupMembers}
+            setSelectedGroupMembers={setNewGroupMembers}
+            groupError={newGroupError}
+            setGroupError={setNewGroupError}
+            creatingGroup={creatingGroup}
+            onCreate={handleCreateGroup}
+            onClose={closeNewGroupModal}
+            title={
+              editingGroup
+                ? `Edit ${groupModalType === "channel" ? "channel" : "group"}`
+                : `New ${groupModalType === "channel" ? "channel" : "group"}`
+            }
+            submitLabel={editingGroup ? "Save" : "Create"}
+            avatarPreview={groupAvatarPreview}
+            avatarColor={editingGroup ? activeChat?.group_color || "#10b981" : "#10b981"}
+            avatarName={
+              newGroupForm.nickname ||
+              newGroupForm.username ||
+              (groupModalType === "channel" ? "Channel" : "Group")
+            }
+            onAvatarChange={handleGroupAvatarChange}
+            onAvatarRemove={handleGroupAvatarRemove}
+            showAvatarField={editingGroup}
+            hideSelectedMemberChips={false}
+            fileUploadEnabled={CHAT_PAGE_CONFIG.fileUploadEnabled}
+            showInviteManagement={editingGroup}
+            currentInviteLink={editGroupInviteLink}
+            regeneratingInviteLink={regeneratingGroupInviteLink}
+            onRegenerateInvite={handleRegenerateGroupInvite}
+            entityLabel={groupModalType === "channel" ? "Channel" : "Group"}
+            onDeleteChat={editingGroup ? handleDeleteActiveGroup : null}
+          />
+        </Suspense>
+      ) : null}
+
+      {groupInviteOpen ? (
+        <Suspense fallback={null}>
+          <GroupInviteLinkModal
+            open={groupInviteOpen}
+            inviteLink={createdGroupInviteLink}
+            onClose={() => setGroupInviteOpen(false)}
+          />
+        </Suspense>
+      ) : null}
+
+      {profileModalOpen ? (
+        <Suspense fallback={null}>
+          <ChatProfileModal
+            open={profileModalOpen}
+            chat={
+              mentionProfileChat ||
+              ((mentionProfileUser || profileModalMember)
+                ? { ...(activeChat || {}), type: "dm" }
+                : activeChat)
+            }
+            targetUser={profileTargetUser}
+            currentUser={user}
+            muted={activeChatMuted}
+            inviteLink={profileInviteLink}
+            canViewInvite={canCurrentUserViewInvite}
+            readOnly={Boolean(
+              mentionProfile &&
+                mentionProfile.kind !== "user" &&
+                !mentionProfileChat?.isMember,
+            )}
+            showJoinAction={canJoinMentionChat}
+            onJoinChat={handleJoinMentionChat}
+            showMembers={shouldShowMembersList}
+            membersBatchSize={CHAT_PAGE_CONFIG.newChatSearchMaxResults}
+            onClose={closeProfileModal}
+            onOpenChat={handleOpenProfileChat}
+            onToggleMute={() =>
+              toggleMuteChat(mentionProfileChat?.id || activeChat?.id)
+            }
+            onLeaveGroup={() =>
+              requestLeaveGroupById(mentionProfileChat?.id || activeChat?.id)
+            }
+            onOpenMember={openMemberProfileFromList}
+            onRemoveMember={handleRemoveGroupMember}
+            onOpenUserContextMenu={openContextMenu}
+            onEditGroup={openEditGroupFromProfile}
+            onEditSelfProfile={openSelfProfileEditor}
+          />
+        </Suspense>
+      ) : null}
+
+      {notificationsModalOpen ? (
+        <Suspense fallback={null}>
+          <NotificationsSettingsModal
+            open={notificationsModalOpen}
+            onClose={() => setNotificationsModalOpen(false)}
+            notificationsActive={notificationsActive}
+            notificationsDisabled={notificationsDisabled}
+            notificationStatusLabel={notificationStatusLabel}
+            onToggleNotifications={handleToggleNotifications}
+            onTestPush={handleTestPush}
+            testNotificationSent={testNotificationSent}
+            notificationsEnabled={notificationsEnabled}
+            debugLine={notificationsDebugLine}
+          />
+        </Suspense>
+      ) : null}
+
+      {settingsPanel && mobileTab !== "settings" ? (
+        <Suspense fallback={null}>
+          <DesktopSettingsModal
+            settingsPanel={settingsPanel}
+            setSettingsPanel={setSettingsPanel}
+            handleProfileSave={handleProfileSave}
+            avatarPreview={avatarPreview}
+            profileForm={profileForm}
+            handleAvatarChange={handleAvatarChange}
+            handleAvatarRemove={handleAvatarRemove}
+            setProfileForm={setProfileForm}
+            statusSelection={statusSelection}
+            setStatusSelection={setStatusSelection}
+            handlePasswordSave={handlePasswordSave}
+            passwordForm={passwordForm}
+            setPasswordForm={setPasswordForm}
+            userColor={userColor}
+            profileError={profileError}
+            passwordError={passwordError}
+            fileUploadEnabled={CHAT_PAGE_CONFIG.fileUploadEnabled}
+            onClearCache={handleClearCache}
+            dataCacheStats={dataCacheStats}
+            currentUser={user}
+            onDeleteAccount={handleDeleteAccount}
+            appInfo={appInfo}
+            appInfoLoading={appInfoLoading}
+            appInfoError={appInfoError}
+            onOpenWhatsNew={handleOpenWhatsNew}
+          />
+        </Suspense>
+      ) : null}
+
+      {whatsNewOpen ? (
+        <Suspense fallback={null}>
+          <WhatsNewModal
+            open={whatsNewOpen}
+            version={appInfo?.version || ""}
+            changelog={appInfo?.changelog || ""}
+            onClose={() => dismissWhatsNew(true)}
+          />
+        </Suspense>
+      ) : null}
+
+      <AppContextMenu menu={contextMenu} onClose={closeContextMenu} />
     </div>
   );
 }
-
-
-
-
-
-
