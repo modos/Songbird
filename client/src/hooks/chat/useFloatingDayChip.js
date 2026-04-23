@@ -24,8 +24,8 @@ export function useFloatingDayChip() {
     const scrollerRect = target.getBoundingClientRect();
     const floatingRect = floatingChipRef.current?.getBoundingClientRect();
     const targetTop = floatingRect
-      ? floatingRect.top + floatingRect.height / 2
-      : scrollerRect.top + 108;
+      ? floatingRect.top + Math.max(8, floatingRect.height * 0.18)
+      : scrollerRect.top + 92;
     const groups = Array.from(target.querySelectorAll("[id^='day-group-']"));
     if (groups.length) {
       let chosen = groups[0];
@@ -47,8 +47,14 @@ export function useFloatingDayChip() {
 
   const handleFloatingChipClick = useCallback(
     (event, { chatScrollRef, isDesktop, floatingDay }) => {
-      const node = document.getElementById(`day-group-${floatingDay.key}`);
       const scroller = chatScrollRef?.current;
+      const escapedDayKey =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(floatingDay.key)
+          : String(floatingDay.key || "").replace(/["\\]/g, "\\$&");
+      const node =
+        scroller?.querySelector?.(`#day-group-${escapedDayKey}`) ||
+        document.getElementById(`day-group-${floatingDay.key}`);
       if (!node || !scroller) return;
       const floatingChip = event.currentTarget;
       const currentKey = floatingDay.key;
@@ -61,21 +67,24 @@ export function useFloatingDayChip() {
         floatingChipAlignTimerRef.current = null;
       }
 
-      const stickyChip =
-        node.querySelector("[data-day-chip]")?.parentElement || node;
-      const stickyRect = stickyChip.getBoundingClientRect();
+      const stickyChip = node.querySelector("[data-day-chip]")?.parentElement || node;
       const floatingRect = floatingChip.getBoundingClientRect();
+      const stickyRect = stickyChip.getBoundingClientRect();
       // Device-specific alignment nudge tuned to match visual chip overlap.
       const alignOffsetPx = isDesktop ? 0 : -1;
       const desiredStickyTopInViewport = floatingRect.top + alignOffsetPx;
       const delta = stickyRect.top - desiredStickyTopInViewport;
       const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-      const targetTop = Math.max(
+      const nextTargetTop = Math.max(
         0,
         Math.min(maxTop, scroller.scrollTop + delta),
       );
 
-      scroller.scrollTo({ top: targetTop, behavior: "smooth" });
+      const distance = Math.abs(nextTargetTop - scroller.scrollTop);
+      scroller.scrollTo({
+        top: nextTargetTop,
+        behavior: distance > 1 ? "smooth" : "auto",
+      });
 
       const runFinalAlign = (releaseLock = false) => {
         const nextStickyChip =

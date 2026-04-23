@@ -100,6 +100,7 @@ export default function ChatWindowPanel({
   onOpenContextMenu,
   mentionRefreshToken = 0,
   onUserScrollIntent,
+  onFloatingDayNavigate,
   canSwipeReply = true,
   fileUploadEnabled = true,
   fileUploadInProgress = false,
@@ -207,10 +208,6 @@ export default function ChatWindowPanel({
     () => new Set(),
   );
   const [composerFocused, setComposerFocused] = useState(false);
-  const [headerOffset, setHeaderOffset] = useState(0);
-  const ua =
-    typeof navigator !== "undefined" ? navigator.userAgent || "" : "";
-  const isIOSFirefox = /FxiOS/i.test(ua);
   const touchStartXRef = useRef(0);
   const touchStartYRef = useRef(0);
   const touchDxRef = useRef(0);
@@ -245,6 +242,20 @@ export default function ChatWindowPanel({
   const permissionBannerRef = useRef(null);
   const [permissionBannerHeight, setPermissionBannerHeight] = useState(0);
   useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const syncComposerFocus = () => {
+      const activeEl = document.activeElement;
+      setComposerFocused(activeEl === composerInputRef?.current);
+    };
+    syncComposerFocus();
+    document.addEventListener("focusin", syncComposerFocus);
+    document.addEventListener("focusout", syncComposerFocus);
+    return () => {
+      document.removeEventListener("focusin", syncComposerFocus);
+      document.removeEventListener("focusout", syncComposerFocus);
+    };
+  }, [composerInputRef]);
+  useEffect(() => {
     if (!insecureConnection) return;
     if (typeof window === "undefined") return;
     const dismissed =
@@ -268,37 +279,6 @@ export default function ChatWindowPanel({
     observer.observe(node);
     return () => observer.disconnect();
   }, [insecureConnection, hideInsecureTooltip]);
-  useLayoutEffect(() => {
-    if (isDesktop || isIOSFirefox || !composerFocused) {
-      setHeaderOffset(0);
-      return;
-    }
-    const root = document.documentElement;
-    const viewport = window.visualViewport;
-    if (!viewport) {
-      setHeaderOffset(12);
-      return;
-    }
-    const update = () => {
-      const raw =
-        root?.style?.getPropertyValue?.("--vv-top-offset") ||
-        window.getComputedStyle(root).getPropertyValue("--vv-top-offset");
-      const vvTop = Number(String(raw || "").replace("px", "")) || 0;
-      const next = Math.min(Math.max(0, vvTop), 0);
-      setHeaderOffset(next);
-    };
-    update();
-    viewport.addEventListener("resize", update);
-    viewport.addEventListener("scroll", update);
-    window.addEventListener("focusin", update);
-    window.addEventListener("focusout", update);
-    return () => {
-      viewport.removeEventListener("resize", update);
-      viewport.removeEventListener("scroll", update);
-      window.removeEventListener("focusin", update);
-      window.removeEventListener("focusout", update);
-    };
-  }, [composerFocused, isDesktop, isIOSFirefox]);
   useLayoutEffect(() => {
     if (!permissionsPrompt?.show) {
       setPermissionBannerHeight(0);
@@ -646,6 +626,27 @@ export default function ChatWindowPanel({
     setIsTimelineScrollable,
   ]);
 
+  const getFileRenderType = useCallback((file) => {
+    const explicitKind = String(file?.kind || "").toLowerCase();
+    const mimeType = String(file?.mimeType || "").toLowerCase();
+    const name = String(file?.name || "").toLowerCase();
+    if (mimeType.startsWith("audio/")) return "audio";
+    if (explicitKind === "voice" || explicitKind === "audio") return "audio";
+    if (explicitKind === "document") return "document";
+    if (explicitKind === "media") {
+      const explicitMime = String(file?.mimeType || "").toLowerCase();
+      if (explicitMime.startsWith("image/")) return "image";
+      if (explicitMime.startsWith("video/")) return "video";
+    }
+    if (mimeType.startsWith("audio/")) return "audio";
+    if (mimeType.startsWith("image/")) return "image";
+    if (mimeType.startsWith("video/")) return "video";
+    if (/\.(mp3|m4a|aac|wav|ogg|opus|webm)$/.test(name)) return "audio";
+    if (/\.(gif|png|jpe?g|webp|bmp|svg)$/.test(name)) return "image";
+    if (/\.(mp4|mov|webm|mkv|avi|m4v)$/.test(name)) return "video";
+    return "document";
+  }, []);
+
   useEffect(() => {
     if (isDesktop || !activeChatId) return;
     let firstVideoUrl = null;
@@ -670,7 +671,7 @@ export default function ChatWindowPanel({
       warmupVideo.removeAttribute("src");
       warmupVideo.load();
     };
-  }, [isDesktop, activeChatId, messages]);
+  }, [isDesktop, activeChatId, messages, getFileRenderType]);
 
   useEffect(() => {
     if (!showUploadMenu) return;
@@ -768,13 +769,29 @@ export default function ChatWindowPanel({
     });
   }
 
-  const handleGroupChipClick = (groupIndex) => {
-    const dayKey = groupedMessages[groupIndex]?.dayKey;
+  const handleGroupChipClick = (groupKeyOrIndex) => {
+    const dayKey =
+      typeof groupKeyOrIndex === "string"
+        ? groupKeyOrIndex
+        : groupedMessages[groupKeyOrIndex]?.dayKey;
     if (!dayKey) return;
     const node = document.getElementById(`day-group-${dayKey}`);
-    if (node && typeof node.scrollIntoView === "function") {
-      node.scrollIntoView({ block: "start", behavior: "smooth" });
-    }
+    const scroller = chatScrollRef?.current;
+    if (!node || !scroller) return;
+    const containerRect = scroller.getBoundingClientRect();
+    const nodeRect = node.getBoundingClientRect();
+    const targetTop = Math.max(
+      0,
+      Math.min(
+        scroller.scrollHeight - scroller.clientHeight,
+        scroller.scrollTop + (nodeRect.top - containerRect.top) - 12,
+      ),
+    );
+    const distance = Math.abs(targetTop - scroller.scrollTop);
+    scroller.scrollTo({
+      top: targetTop,
+      behavior: distance > 1 ? "smooth" : "auto",
+    });
   };
 
   const chatScrollStyle = useMemo(
@@ -784,6 +801,8 @@ export default function ChatWindowPanel({
         : "radial-gradient(circle at top right, rgba(16,185,129,0.10), transparent 45%), radial-gradient(circle at bottom left, rgba(16,185,129,0.09), transparent 40%)",
       backgroundColor: isDark ? "#0b1320" : "#dcfce7",
       scrollbarGutter: "stable both-edges",
+      overscrollBehaviorY:
+        !isDesktop && composerFocused ? "none" : "contain",
       paddingTop:
         activeChatId && insecureConnection
           ? insecureConnection
@@ -797,7 +816,15 @@ export default function ChatWindowPanel({
         : undefined,
       overflowAnchor: "none",
     }),
-    [activeChatId, insecureConnection, isDark, showComposer, showChannelMuteFooter],
+    [
+      activeChatId,
+      composerFocused,
+      insecureConnection,
+      isDark,
+      isDesktop,
+      showComposer,
+      showChannelMuteFooter,
+    ],
   );
 
   const handleTouchStart = (event) => {
@@ -830,27 +857,6 @@ export default function ChatWindowPanel({
       closeChat?.();
     }
   };
-
-  const getFileRenderType = useCallback((file) => {
-    const explicitKind = String(file?.kind || "").toLowerCase();
-    const mimeType = String(file?.mimeType || "").toLowerCase();
-    const name = String(file?.name || "").toLowerCase();
-    if (mimeType.startsWith("audio/")) return "audio";
-    if (explicitKind === "voice" || explicitKind === "audio") return "audio";
-    if (explicitKind === "document") return "document";
-    if (explicitKind === "media") {
-      const explicitMime = String(file?.mimeType || "").toLowerCase();
-      if (explicitMime.startsWith("image/")) return "image";
-      if (explicitMime.startsWith("video/")) return "video";
-    }
-    if (mimeType.startsWith("audio/")) return "audio";
-    if (mimeType.startsWith("image/")) return "image";
-    if (mimeType.startsWith("video/")) return "video";
-    if (/\.(mp3|m4a|aac|wav|ogg|opus|webm)$/.test(name)) return "audio";
-    if (/\.(gif|png|jpe?g|webp|bmp|svg)$/.test(name)) return "image";
-    if (/\.(mp4|mov|webm|mkv|avi|m4v)$/.test(name)) return "video";
-    return "document";
-  }, []);
 
   const handleVideoThumbLoadedMetadata = useCallback(
     (event) => {
@@ -893,6 +899,7 @@ export default function ChatWindowPanel({
       loadedMediaThumbs,
       mediaAspectByKey,
       videoPosterByUrl,
+      VIDEO_POSTER_CACHE_KEY,
       openFocusMedia,
       onMessageMediaLoaded,
       handleVideoThumbLoadedMetadata,
@@ -900,29 +907,9 @@ export default function ChatWindowPanel({
     ],
   );
 
-  const handleComposerFocusChange = useCallback(
-    (nextFocused) => {
-      const focused = Boolean(nextFocused);
-      setComposerFocused(focused);
-      if (isDesktop) return;
-      if (!focused) {
-        setKeyboardOffset(0);
-        return;
-      }
-      if (typeof window === "undefined") {
-        setKeyboardOffset(12);
-        return;
-      }
-      const viewport = window.visualViewport;
-      if (!viewport) {
-        setKeyboardOffset(12);
-        return;
-      }
-      const next = Math.max(0, Number(viewport.offsetTop || 0));
-      setKeyboardOffset(next > 0 ? next : 12);
-    },
-    [isDesktop],
-  );
+  const handleComposerFocusChange = useCallback((nextFocused) => {
+    setComposerFocused(Boolean(nextFocused));
+  }, []);
 
   const renderMessageItem = (msg, options = {}) => (
     <MessageItem
@@ -1006,8 +993,7 @@ export default function ChatWindowPanel({
         top: "0px",
         height: "100%",
         zIndex: isDesktop ? "auto" : "var(--app-z, 20)",
-        paddingTop:
-          "max(0px, calc(env(safe-area-inset-top) + var(--vv-top-offset, 0px)))",
+        paddingTop: "max(0px, env(safe-area-inset-top))",
       }}
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
@@ -1019,12 +1005,7 @@ export default function ChatWindowPanel({
             <div
               className="flex h-[72px] items-center justify-between gap-3 border-b border-slate-300/80 bg-white px-6 py-4 dark:border-emerald-500/20 dark:bg-slate-900"
               style={{
-                transform:
-                  !isDesktop && composerFocused
-                    ? `translateY(${headerOffset}px)`
-                    : "translateY(0px)",
-                transition: !isDesktop ? "transform 140ms ease-out" : "none",
-                willChange: !isDesktop ? "transform" : "auto",
+                position: "relative",
               }}
             >
             <button
@@ -1441,13 +1422,14 @@ export default function ChatWindowPanel({
             <button
               ref={floatingChipRef}
               type="button"
-              onClick={(event) =>
+              onClick={(event) => {
+                onFloatingDayNavigate?.();
                 handleFloatingChipClick(event, {
                   chatScrollRef,
                   isDesktop,
                   floatingDay,
-                })
-              }
+                });
+              }}
               className="inline-flex items-center justify-center rounded-full border border-emerald-200/60 bg-white/90 px-3 py-1 text-[11px] font-semibold text-emerald-700 shadow-sm transition hover:border-emerald-300 hover:shadow-md dark:border-emerald-500/30 dark:bg-slate-950 dark:text-emerald-200"
             >
               <span className="leading-none">{floatingDay.label}</span>
@@ -1516,9 +1498,7 @@ export default function ChatWindowPanel({
             onComposerHeightChange={(value) => {
               setComposerHeight(Math.max(80, Number(value || 80)));
             }}
-            onComposerFocusChange={(nextFocused) => {
-              setComposerFocused(Boolean(nextFocused));
-            }}
+            onComposerFocusChange={handleComposerFocusChange}
             composerInputRef={composerInputRef}
             microphonePermissionStatus={microphonePermissionStatus}
             onRequestMicrophonePermission={onRequestMicrophonePermission}
