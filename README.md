@@ -1,3 +1,5 @@
+[English](/README.md) | [فارسی](/README.fa_IR.md)
+
 <div align="center">
 
 # <img src="./client/public/songbird-logo.svg"> Songbird
@@ -157,13 +159,13 @@ cd /opt/songbird
 git clone https://github.com/bllackbull/Songbird.git .
 ```
 
->**Note:** <br>
->If you installed Node.js using nvm:
->
->```bash
->nvm install
->nvm use
->```
+> [!NOTE]
+> If you installed Node.js using nvm:
+> 
+> ```bash
+> nvm install
+> nvm use
+> ```
 
 
 
@@ -178,7 +180,7 @@ npm install
 npm run build
 ```
 
-### 4. Create systemd service for the Node server
+### 4. Create systemd service
 
 Create `/etc/systemd/system/songbird.service` with the following:
 
@@ -198,7 +200,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-> **NOTE:**
+> [!IMPORTANT]
 > - If you installed Node.js using nvm, set this as Node path in `ExectStart`:
 >
 >```ini
@@ -214,7 +216,8 @@ WantedBy=multi-user.target
 
 **Recommended: Create a dedicated user:**
 
-> **NOTE:** Skip this step if you installed Node.js using nvm or volta.
+> [!WARNING]
+> Skip this step if you installed Node.js using nvm or volta.
 
 Due to security conserns, it is recommended to create a dedicated system user and change ownership of the project directory:
 
@@ -247,13 +250,22 @@ sudo systemctl enable --now songbird.service
 
 ## Configure Nginx
 
-### Option A: Domain Setup (HTTPS)
+Songbird serves both the built frontend and the API from the Node server, so Nginx only needs to proxy one upstream: `http://127.0.0.1:SERVER_PORT`.
 
-#### 1. Create an Nginx site file at `/etc/nginx/sites-available/songbird`:
+Create `/etc/nginx/sites-available/songbird`:
+
+> [!IMPORTANT]
+> - Keep `proxy_pass` aligned with `SERVER_PORT`.
+> - Keep the Nginx `listen` port aligned with `CLIENT_PORT`.
+> - Keep `client_max_body_size` aligned with `FILE_UPLOAD_MAX_TOTAL_SIZE`.
+
+### HTTP only
+
+Use this if you are not enabling SSL yet:
 
 ```nginx
 server {
-  listen 80;
+  listen 80 default_server;
   server_name example.com www.example.com;
   client_max_body_size 78643200;
 
@@ -285,40 +297,26 @@ server {
 }
 ```
 
-#### 2. Enable the site and test Nginx config:
+If you are using the server IP directly, replace `server_name example.com www.example.com;` with:
 
-```bash
-sudo ln -s /etc/nginx/sites-available/songbird /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl reload nginx
+```nginx
+server_name _;
 ```
 
-#### 3. Get SSL for domain
+### HTTPS
 
-Request ssl from certbot:
-
-```bash
-sudo certbot --nginx --https-port 443 -d example.com -d www.example.com
-sudo certbot renew --dry-run
-```
-
-Or if you are sure you already have ssl for your domain, use this command to only install the certificate on your nginx config:
-
-```bash
-sudo certbot install --nginx --https-port 443 --cert-name example.com -d example.com -d www.example.com
-```
-
-### Option B: Server IP (HTTP)
-
-If you want to run only on your server IP over HTTP, you can skip Certbot entirely.
-
-#### 1. Use this Nginx server block instead:
+After you have certificate files, switch to this:
 
 ```nginx
 server {
-  listen 80 default_server;
-  server_name _;
+  listen 443 ssl default_server;
+  server_name example.com www.example.com;
   client_max_body_size 78643200;
+
+  ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 1d;
 
   location /api/events {
     proxy_pass http://127.0.0.1:5174;
@@ -346,49 +344,75 @@ server {
     proxy_cache_bypass $http_upgrade;
   }
 }
+
+server {
+  listen 80;
+  server_name example.com www.example.com;
+  return 301 https://$host$request_uri;
+}
 ```
 
-#### 2. Enable the site and test Nginx config:
+Enable the site:
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/songbird /etc/nginx/sites-enabled/
+sudo ln -sf /etc/nginx/sites-available/songbird /etc/nginx/sites-enabled/songbird
+sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-### Optional: Enable firewall
+## SSL certificates
+
+HTTPS is recommended, especially if you want push notifications.
+
+### Option A: Certbot for a domain
+
+For domain-based installs, Certbot is the simplest option:
 
 ```bash
-sudo ufw allow 'Nginx Full'
-sudo ufw enable
+sudo certbot certonly --nginx --https-port 443 -d example.com -d www.example.com
+sudo certbot install --nginx --https-port 443 --cert-name example.com -d example.com -d www.example.com
+sudo certbot renew --dry-run
 ```
 
-> **NOTE:**
-> - If you set `SERVER_PORT` to a different value, update `proxy_pass` accordingly.
-> - If you use HTTP, nginx port doesn't have to be `80` .
-> - Keep `client_max_body_size` aligned with `FILE_UPLOAD_MAX_TOTAL_SIZE` (total request size).
+If you use a different HTTPS port, replace `443` with your `CLIENT_PORT`.
+
+### Option B: Use existing certificate files
+
+If you already have `fullchain.pem` and `privkey.pem`, point Nginx to them:
+
+```nginx
+ssl_certificate /path/to/fullchain.pem;
+ssl_certificate_key /path/to/privkey.pem;
+```
+
+This works for both domain and IP setups as long as your certificate covers what you are serving.
+
+### Option C: Use the deploy script
+
+[`songbird-deploy`](#deployment-script) can configure Nginx for you and also handle SSL setup. That is the easiest path if you do not want to manage the Nginx and certificate steps manually.
 
 ## Common troubleshooting
 
-- Docker logs: 
+Docker logs: 
 
 ```bash
 docker compose -f docker-compose.yaml logs -f
 ```
 
-- systemd service logs:
+systemd service logs:
 
 ```bash
 sudo journalctl -u songbird -f
 ```
 
-- Check Nginx error logs:
+Check Nginx error logs:
 
 ```bash
 nano /var/log/nginx/error.log
 ```
 
-- If Docker build looks stuck at `RUN npm ci`, it is usually downloading dependencies. Use plain progress for visibility:
+If Docker build looks stuck at `RUN npm ci`, it is usually downloading dependencies. Use plain progress for visibility:
 
 ```bash
 docker compose -f docker-compose.yaml build --no-cache --progress=plain
@@ -401,6 +425,7 @@ You can configure environment variables to customize app behavior.
 ```bash
 cd /opt/songbird
 cp .env.example .env
+nano .env
 ```
 
 ### Configurable values:
@@ -442,8 +467,10 @@ cp .env.example .env
 | `VAPID_PRIVATE_KEY` | `string` | auto-generated | Web Push private key (required for push notifications). |
 | `VAPID_SUBJECT` | `string` | auto-generated | Contact for VAPID (email or URL). Used by push providers. |
 
+> [!NOTE]
 > **Push notifications require HTTPS** (except `localhost` for development). iOS requires an installed PWA (iOS 16.4+).
 
+> [!IMPORTANT]
 > **Encryption at rest:** Songbird auto-generates `STORAGE_ENCRYPTION_KEY` on first run and saves it into `.env`. Keep that value stable. On startup, the server backfills existing stored messages and message-upload files into encrypted form when needed.
 
 ### Apply Changes:
@@ -484,9 +511,12 @@ sudo systemctl restart songbird
 sudo systemctl reload nginx
 ```
 
+> [!TIP]
+> You can easily edit your .env file via [songbird-deploy](#deployment-script) script and it would automatically apply and rebuild the app for you!
+
 ## Updating the deployed app
 
-> **Tip:** <br>
+> [!WARNING]
 >Backup your database before updating:
 >
 > ```bash
@@ -497,6 +527,8 @@ sudo systemctl reload nginx
 > ```
 >
 
+> [!TIP]
+> You can easily update your app via [songbird-deploy](#deployment-script) script and it would automatically backup your database and rebuild the app for you!
 
 ### Docker + Compose
 
@@ -521,20 +553,15 @@ sudo systemctl restart songbird
 sudo systemctl reload nginx
 ```
 
-**What each step does:**
-
-- git pull - Fetch and merge latest changes from GitHub
-- npm install (client & server) - Install any new dependencies
-- npm run build - Rebuild the React frontend into client/dist
-- systemctl restart songbird - Restart the Node server to pick up changes
-- systemctl reload nginx - Reload Nginx to serve the new build
-
-If only the frontend code has changed (no `package.json` changes), you can skip the `npm install` steps.
-
-> **Note:** <br>
+> [!NOTE]
 For zero-downtime deployments on larger projects, consider blue-green deployment or PM2, but for most updates the restart approach above is simple and sufficient.
 
 ## Database commands
+
+You can use these commands while in `/opt/songbird/server` directory to manage your database:
+
+> [!TIP]
+> You can easily use database commands via [songbird-deploy](#deployment-script) script!
 
 - Backup DB: `npm run db:backup`
 - Restore DB backup: `npm run db:restore`
@@ -724,35 +751,16 @@ If you plan to host the app at a subpath (e.g., `example.com/songbird/`) you wil
 - Contributions are welcome.
 - If you want to contribute, contact the maintainer first by opening an issue at: `https://github.com/bllackbull/Songbird/issues`
 - For direct coordination, reach out to [@bllackbull](https://github.com/bllackbull) on GitHub before opening a PR.
+- Checkout [Contributing](/CONTRIBUTING.md) guideline for more information.
 
 ## Support
 
 If you like this project which I hope you do, consider supporting your favorite project:
 
-### TRX:
-
-```
-TPf1bEhipKpGkjo5N2Scj9nufNNh5TNrwX
-```
-
-### USDT (TRC20):
-
-```
-0x63313383611BbE11f4fEc139c14ad0b70281b822
-```
-
-### BTC:
-
-```
-bc1q9hupvcc39juhf0k7rgzn6phn8s8jez365kzmuj
-```
-
-### TON:
-
-```
-UQDzQ3xbWzKQvw8X8sWU82dksBeYqTHrT9sLzhBOyaESPjVy
-```
+<a href="https://nowpayments.io/donation?api_key=0b61dd3e-6508-4849-ad92-1dde65442937" target="_blank" rel="noreferrer noopener">
+    <img src="https://nowpayments.io/images/embeds/donation-button-black.svg" alt="Crypto donation button by NOWPayments">
+</a>
 
 ## License
 
-This project is licensed under the MIT License. See the see [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See the see [LICENSE](LICENSE) file for details.s
